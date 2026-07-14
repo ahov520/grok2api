@@ -466,6 +466,7 @@ attemptLoop:
 				continue
 			}
 			lastFailure = newHTTPUpstreamFailure(response.StatusCode, body, credential.ID, credential.Name)
+			promoteBuildForbiddenCredentialFailure(route.Provider, response.StatusCode, lastFailure)
 			if s.providers.SupportsCredentialRefresh(credential.Provider) && !authRecoveryAttempted[credential.ID] && credential.EncryptedRefreshToken != "" && (lastFailure.PermanentAccountDenial || lastFailure.CredentialRejected) {
 				authRecoveryAttempted[credential.ID] = true
 				refreshed, refreshErr := ensureCredential(credential, true)
@@ -1030,6 +1031,14 @@ func waitForModelCapacityRetry(ctx context.Context, attempt int, retryAfter time
 	case <-timer.C:
 		return true
 	}
+}
+
+func promoteBuildForbiddenCredentialFailure(providerValue accountdomain.Provider, status int, failure *UpstreamFailure) {
+	if failure == nil || providerValue != accountdomain.ProviderBuild || status != http.StatusForbidden || failure.UpstreamCode != "upstream_error" {
+		return
+	}
+	failure.AccountScoped = true
+	failure.CredentialRejected = true
 }
 
 func firstError(values ...error) error {

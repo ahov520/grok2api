@@ -30,3 +30,16 @@ func TestWaitForModelCapacityRetryHonorsCancellation(t *testing.T) {
 		t.Fatalf("canceled wait took %s", elapsed)
 	}
 }
+
+func TestPromoteGenericBuildForbiddenToCredentialFailure(t *testing.T) {
+	failure := newHTTPUpstreamFailure(
+		http.StatusForbidden,
+		[]byte(`{"error":{"code":"upstream_error","type":"server_error","message":"Upstream request failed"}}`),
+		1,
+		"account",
+	)
+	promoteBuildForbiddenCredentialFailure("grok_build", http.StatusForbidden, failure)
+	if !failure.AccountScoped || !failure.CredentialRejected {
+		t.Fatalf("failure = %#v", failure)
+	}
+}
