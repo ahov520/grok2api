@@ -125,6 +125,29 @@ func (a *Adapter) ForwardResponse(ctx context.Context, request provider.Response
 	if err := normalizeGzipResponse(resp); err != nil {
 		return nil, err
 	}
+	if request.Streaming && resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		checkedBody, streamError, immediate, preflightErr := preflightResponseStream(resp.Body)
+		if preflightErr != nil {
+			return nil, preflightErr
+		}
+		if immediate {
+			converted := streamError
+			if request.Operation == conversation.OperationChat || request.Operation == conversation.OperationMessages {
+				converted, preflightErr = conversation.ConvertResponseJSONWithOptions(streamError, request.Operation, conversationOptions)
+				if preflightErr != nil {
+					return nil, preflightErr
+				}
+			}
+			resp.StatusCode = responseStreamErrorStatus(streamError)
+			resp.Status = http.StatusText(resp.StatusCode)
+			resp.Body = io.NopCloser(bytes.NewReader(converted))
+			resp.Header.Set("Content-Type", "application/json")
+			resp.Header.Set("Content-Length", strconv.Itoa(len(converted)))
+			resp.Header.Set("Retry-After", "2")
+		} else {
+			resp.Body = checkedBody
+		}
+	}
 	responsesOperation := request.Operation == "" || request.Operation == conversation.OperationResponses
 	if responsesOperation && toolCompatibility != nil {
 		if warnings := toolCompatibility.warningHeader(); warnings != "" {

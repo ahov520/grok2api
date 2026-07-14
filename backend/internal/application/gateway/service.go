@@ -523,7 +523,12 @@ attemptLoop:
 			s.logger.Warn("upstream_request_failed", "request_id", input.RequestID, "account_id", credential.ID, "provider", credential.Provider, "status", response.StatusCode, "upstream_code", lastFailure.UpstreamCode, "account_scoped", lastFailure.AccountScoped)
 			if !lastFailure.AccountScoped {
 				failureFingerprints[lastFailure.Fingerprint]++
-				if failureFingerprints[lastFailure.Fingerprint] >= 2 {
+				if lastFailure.ModelCapacity {
+					if attempt+1 < attempts && !waitForModelCapacityRetry(ctx, attempt, retryAfter) {
+						lastErr = ctx.Err()
+						break
+					}
+				} else if failureFingerprints[lastFailure.Fingerprint] >= 2 {
 					break
 				}
 			}
@@ -1009,6 +1014,22 @@ func parseRetryAfter(value string, now time.Time) time.Duration {
 		return parsed.Sub(now)
 	}
 	return 0
+}
+
+func waitForModelCapacityRetry(ctx context.Context, attempt int, retryAfter time.Duration) bool {
+	delay := time.Second << min(max(attempt, 0), 3)
+	if retryAfter > delay {
+		delay = retryAfter
+	}
+	delay = min(delay, 10*time.Second)
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
 }
 
 func firstError(values ...error) error {

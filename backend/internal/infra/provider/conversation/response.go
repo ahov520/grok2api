@@ -78,15 +78,15 @@ func ConvertResponseJSONWithOptions(body []byte, operation string, options Respo
 	if operation == OperationResponses {
 		return body, nil
 	}
+	if errorValue, ok := decodeResponseError(body); ok {
+		if operation == OperationMessages {
+			return anthropicErrorJSON(errorValue), nil
+		}
+		return openAIErrorJSON(errorValue), nil
+	}
 	var envelope responseEnvelope
 	if err := json.Unmarshal(body, &envelope); err != nil {
 		return nil, fmt.Errorf("解析 Responses 响应: %w", err)
-	}
-	if envelope.Error != nil {
-		if operation == OperationMessages {
-			return anthropicErrorJSON(envelope.Error), nil
-		}
-		return body, nil
 	}
 	parsed := parseResponse(envelope)
 	if operation == OperationMessages {
@@ -269,18 +269,73 @@ func anthropicUsage(value responseUsage) map[string]any {
 }
 
 func anthropicErrorJSON(value any) []byte {
-	message := "Upstream request failed"
+	object, message := responseErrorDetails(value)
 	errorType := "api_error"
-	if object, ok := value.(map[string]any); ok {
-		if text, ok := object["message"].(string); ok && text != "" {
-			message = text
-		}
+	if object != nil {
 		errorType = normalizeAnthropicErrorType(object)
-	} else if text, ok := value.(string); ok && strings.TrimSpace(text) != "" {
-		message = text
 	}
 	data, _ := json.Marshal(map[string]any{"type": "error", "error": map[string]any{"type": errorType, "message": message}})
 	return data
+}
+
+func openAIErrorJSON(value any) []byte {
+	data, _ := json.Marshal(openAIErrorPayload(value))
+	return data
+}
+
+func openAIErrorPayload(value any) map[string]any {
+	object, message := responseErrorDetails(value)
+	code := "upstream_error"
+	errorType := "server_error"
+	if object != nil {
+		if candidate, ok := object["code"].(string); ok && strings.TrimSpace(candidate) != "" {
+			code = strings.TrimSpace(candidate)
+		}
+	}
+	normalized := strings.ToLower(message + " " + code)
+	switch {
+	case strings.Contains(normalized, "capacity"), strings.Contains(normalized, "high demand"), strings.Contains(normalized, "overloaded"):
+		code = "model_capacity_exceeded"
+	case strings.Contains(normalized, "rate limit"), strings.Contains(normalized, "rate_limit"), strings.Contains(normalized, "too many requests"):
+		code = "rate_limit_exceeded"
+		errorType = "rate_limit_error"
+	}
+	return map[string]any{"error": map[string]any{
+		"message": message, "type": errorType, "code": code, "param": nil,
+	}}
+}
+
+func decodeResponseError(body []byte) (any, bool) {
+	var root map[string]any
+	if json.Unmarshal(body, &root) != nil {
+		return nil, false
+	}
+	if value, exists := root["error"]; exists && value != nil {
+		return value, true
+	}
+	if response, ok := root["response"].(map[string]any); ok {
+		if value, exists := response["error"]; exists && value != nil {
+			return value, true
+		}
+	}
+	if typeName, _ := root["type"].(string); typeName == "error" || typeName == "response.failed" {
+		return root, true
+	}
+	return nil, false
+}
+
+func responseErrorDetails(value any) (map[string]any, string) {
+	message := "Upstream request failed"
+	if object, ok := value.(map[string]any); ok {
+		if text, ok := object["message"].(string); ok && strings.TrimSpace(text) != "" {
+			message = strings.TrimSpace(text)
+		}
+		return object, message
+	}
+	if text, ok := value.(string); ok && strings.TrimSpace(text) != "" {
+		message = strings.TrimSpace(text)
+	}
+	return nil, message
 }
 
 func normalizeAnthropicErrorType(object map[string]any) string {

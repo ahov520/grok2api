@@ -23,6 +23,7 @@ type UpstreamFailure struct {
 	QuotaExhausted         bool
 	FreeQuotaExhausted     bool
 	ModelQuotaExhausted    bool
+	ModelCapacity          bool
 	CredentialRejected     bool
 	Fingerprint            string
 	Cause                  error
@@ -99,6 +100,7 @@ func newHTTPUpstreamFailure(status int, body []byte, accountID uint64, accountNa
 		failure.Code = "upstream_server_error"
 		failure.PublicMessage = "上游服务暂时异常"
 	}
+	failure.ModelCapacity = isModelCapacityFailure(metadataText)
 	fingerprintPart := normalizeFailureCode(firstNonEmptyFailure(upstreamCode, upstreamType, upstreamMessage))
 	if fingerprintPart == "" {
 		fingerprintPart = "unknown"
@@ -168,6 +170,10 @@ func isFreeQuotaExhaustion(text string) bool {
 
 func isModelQuotaExhaustion(text string) bool {
 	return strings.Contains(text, "used all the included free usage for model")
+}
+
+func isModelCapacityFailure(text string) bool {
+	return containsAny(text, "model_capacity_exceeded", "currently at capacity", "high demand", "overloaded")
 }
 
 func containsAny(text string, signals ...string) bool {

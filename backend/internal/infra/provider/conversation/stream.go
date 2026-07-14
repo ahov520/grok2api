@@ -437,11 +437,19 @@ func (c *streamConverter) textDeltaWithoutFilter(delta string) error {
 }
 
 func (c *streamConverter) streamError(data []byte) error {
-	if c.operation == OperationMessages {
-		c.finished = true
-		return c.writeEvent("error", map[string]any{"type": "error", "error": map[string]any{"type": "api_error", "message": string(data)}})
+	errorValue, ok := decodeResponseError(data)
+	if !ok {
+		errorValue = strings.TrimSpace(string(data))
 	}
-	if err := c.writeData(json.RawMessage(data)); err != nil {
+	c.finished = true
+	if c.operation == OperationMessages {
+		var payload map[string]any
+		if err := json.Unmarshal(anthropicErrorJSON(errorValue), &payload); err != nil {
+			return err
+		}
+		return c.writeEvent("error", payload)
+	}
+	if err := c.writeData(openAIErrorPayload(errorValue)); err != nil {
 		return err
 	}
 	_, err := io.WriteString(c.writer, "data: [DONE]\n\n")
