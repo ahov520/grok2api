@@ -1,0 +1,24 @@
+services:
+  - type: web
+    name: grok2api
+    runtime: docker
+    repo: https://github.com/ahov520/grok2api
+    branch: main
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    healthCheckPath: /healthz
+    envVars:
+      - key: TZ
+        value: Asia/Shanghai
+      - key: GROK2API_JWT_SECRET
+        sync: false
+      - key: GROK2API_ENCRYPTION_KEY
+        sync: false
+      - key: GROK2API_ADMIN_PASSWORD
+        sync: false
+      - key: GROK2API_ADMIN_USER
+        value: admin
+    disk:
+      name: grok2api-data
+      mountPath: /app/data
+      sizeGB: 1
