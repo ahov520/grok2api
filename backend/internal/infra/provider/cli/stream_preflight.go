@@ -8,9 +8,13 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"time"
+
+	"github.com/chenyme/grok2api/backend/internal/infra/provider"
 )
 
 const maxResponseStreamPreflightBytes = 1 << 20
+const responseStreamFirstEventTimeout = 15 * time.Second
 
 type prefetchedReadCloser struct {
 	io.Reader
@@ -18,6 +22,34 @@ type prefetchedReadCloser struct {
 }
 
 func preflightResponseStream(source io.ReadCloser) (io.ReadCloser, []byte, bool, error) {
+	return preflightResponseStreamWithTimeout(source, responseStreamFirstEventTimeout)
+}
+
+type responseStreamPreflightResult struct {
+	body      io.ReadCloser
+	failure   []byte
+	immediate bool
+	err       error
+}
+
+func preflightResponseStreamWithTimeout(source io.ReadCloser, timeout time.Duration) (io.ReadCloser, []byte, bool, error) {
+	result := make(chan responseStreamPreflightResult, 1)
+	go func() {
+		body, failure, immediate, err := readResponseStreamPreflight(source)
+		result <- responseStreamPreflightResult{body: body, failure: failure, immediate: immediate, err: err}
+	}()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case value := <-result:
+		return value.body, value.failure, value.immediate, value.err
+	case <-timer.C:
+		_ = source.Close()
+		return nil, nil, false, provider.ErrResponseFirstEventTimeout
+	}
+}
+
+func readResponseStreamPreflight(source io.ReadCloser) (io.ReadCloser, []byte, bool, error) {
 	reader := bufio.NewReaderSize(source, 64<<10)
 	var prefetched bytes.Buffer
 	for prefetched.Len() <= maxResponseStreamPreflightBytes {

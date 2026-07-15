@@ -8,6 +8,8 @@ import (
 	"net/http"
 	"strings"
 	"unicode"
+
+	"github.com/chenyme/grok2api/backend/internal/infra/provider"
 )
 
 // UpstreamFailure 保存可安全暴露给下游和审计的上游失败分类，不包含响应正文或凭据。
@@ -110,13 +112,20 @@ func newHTTPUpstreamFailure(status int, body []byte, accountID uint64, accountNa
 }
 
 func newTransportUpstreamFailure(err error, accountID uint64, accountName string) *UpstreamFailure {
+	status := http.StatusBadGateway
+	accountScoped := false
 	code, message := "upstream_network_error", "连接上游服务失败"
 	if errors.Is(err, context.DeadlineExceeded) {
 		code, message = "upstream_timeout", "上游服务响应超时"
 	}
+	if errors.Is(err, provider.ErrResponseFirstEventTimeout) {
+		code, message = "upstream_first_event_timeout", "上游服务首个响应事件超时"
+		status = http.StatusGatewayTimeout
+		accountScoped = true
+	}
 	return &UpstreamFailure{
-		HTTPStatus: http.StatusBadGateway, Code: code, PublicMessage: message,
-		AccountID: accountID, AccountName: accountName, Fingerprint: code, Cause: err,
+		HTTPStatus: status, Code: code, PublicMessage: message,
+		AccountID: accountID, AccountName: accountName, AccountScoped: accountScoped, Fingerprint: code, Cause: err,
 	}
 }
 

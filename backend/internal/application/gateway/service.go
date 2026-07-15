@@ -406,9 +406,13 @@ attemptLoop:
 				break
 			}
 			lastFailure = newTransportUpstreamFailure(err, credential.ID, credential.Name)
-			failureFingerprints[lastFailure.Fingerprint]++
-			if failureFingerprints[lastFailure.Fingerprint] >= 2 {
-				break
+			if lastFailure.AccountScoped {
+				s.selector.MarkFailure(ctx, credential, lastFailure.HTTPStatus, 0)
+			} else {
+				failureFingerprints[lastFailure.Fingerprint]++
+				if failureFingerprints[lastFailure.Fingerprint] >= 2 {
+					break
+				}
 			}
 			continue
 		}

@@ -1,10 +1,34 @@
 package cli
 
 import (
+	"errors"
 	"io"
 	"strings"
+	"sync"
 	"testing"
+	"time"
+
+	"github.com/chenyme/grok2api/backend/internal/infra/provider"
 )
+
+type blockingReadCloser struct {
+	done chan struct{}
+	once sync.Once
+}
+
+func newBlockingReadCloser() *blockingReadCloser {
+	return &blockingReadCloser{done: make(chan struct{})}
+}
+
+func (r *blockingReadCloser) Read([]byte) (int, error) {
+	<-r.done
+	return 0, io.EOF
+}
+
+func (r *blockingReadCloser) Close() error {
+	r.once.Do(func() { close(r.done) })
+	return nil
+}
 
 func TestPreflightResponseStreamDetectsCapacityError(t *testing.T) {
 	const event = "event: error\ndata: {\"type\":\"error\",\"message\":\"The model is currently at capacity.\"}\n\n"
@@ -35,5 +59,17 @@ func TestPreflightResponseStreamPreservesNormalEvent(t *testing.T) {
 	}
 	if string(converted) != event {
 		t.Fatalf("stream changed:\n%s", converted)
+	}
+}
+
+func TestPreflightResponseStreamTimesOutBeforeFirstEvent(t *testing.T) {
+	source := newBlockingReadCloser()
+	started := time.Now()
+	_, _, _, err := preflightResponseStreamWithTimeout(source, 20*time.Millisecond)
+	if !errors.Is(err, provider.ErrResponseFirstEventTimeout) {
+		t.Fatalf("error = %v", err)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("timeout took %s", elapsed)
 	}
 }

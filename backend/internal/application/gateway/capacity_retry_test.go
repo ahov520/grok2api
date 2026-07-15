@@ -5,6 +5,8 @@ import (
 	"net/http"
 	"testing"
 	"time"
+
+	"github.com/chenyme/grok2api/backend/internal/infra/provider"
 )
 
 func TestHTTPUpstreamFailureClassifiesModelCapacity(t *testing.T) {
@@ -40,6 +42,13 @@ func TestPromoteGenericBuildForbiddenToCredentialFailure(t *testing.T) {
 	)
 	promoteBuildForbiddenCredentialFailure("grok_build", http.StatusForbidden, failure)
 	if !failure.AccountScoped || !failure.CredentialRejected {
+		t.Fatalf("failure = %#v", failure)
+	}
+}
+
+func TestFirstEventTimeoutIsAccountScoped(t *testing.T) {
+	failure := newTransportUpstreamFailure(provider.ErrResponseFirstEventTimeout, 1, "account")
+	if !failure.AccountScoped || failure.HTTPStatus != http.StatusGatewayTimeout || failure.Code != "upstream_first_event_timeout" {
 		t.Fatalf("failure = %#v", failure)
 	}
 }

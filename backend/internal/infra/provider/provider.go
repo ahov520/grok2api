@@ -14,11 +14,12 @@ import (
 )
 
 var (
-	ErrAuthorizationPending = errors.New("authorization pending")
-	ErrSlowDown             = errors.New("authorization polling too fast")
-	ErrAuthorizationDenied  = errors.New("authorization denied")
-	ErrCredentialLimit      = errors.New("credential count exceeds limit")
-	ErrUnauthorized         = errors.New("upstream credential unauthorized")
+	ErrAuthorizationPending      = errors.New("authorization pending")
+	ErrSlowDown                  = errors.New("authorization polling too fast")
+	ErrAuthorizationDenied       = errors.New("authorization denied")
+	ErrCredentialLimit           = errors.New("credential count exceeds limit")
+	ErrUnauthorized              = errors.New("upstream credential unauthorized")
+	ErrResponseFirstEventTimeout = errors.New("upstream response first event timeout")
 )
 
 // CredentialRefreshError 区分需要重新认证的永久 OAuth 错误与可后台退避重试的临时错误。
