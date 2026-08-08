@@ -54,4 +54,21 @@ os.chmod(temporary, 0o600)
 os.replace(temporary, path)
 PYEOF
 
+# Tiny HTTP liveness server so a Web Service deployment (Render free plan
+# only allows web services) stays awake: Render pings /healthz periodically.
+python3 -c '
+import http.server, socketserver
+class Handler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Length", "2")
+        self.end_headers()
+        self.wfile.write(b"ok")
+    def log_message(self, *args):
+        pass
+socketserver.TCPServer(("0.0.0.0", 8000), Handler).serve_forever()
+' &
+LIVENESS_PID=$!
+trap 'kill $LIVENESS_PID 2>/dev/null || true' EXIT TERM INT
+
 exec /usr/local/bin/grok2api-egress-quality-guard "$@"
