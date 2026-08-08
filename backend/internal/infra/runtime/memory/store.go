@@ -84,7 +84,8 @@ func cleanupRateShard(shard *rateShard, now time.Time) {
 
 // ConcurrencyLimiter 提供单实例并发租约。
 type ConcurrencyLimiter struct {
-	shards [shardCount]concurrencyShard
+	shards       [shardCount]concurrencyShard
+	indicesCache sync.Pool
 }
 
 type concurrencyShard struct {
@@ -97,6 +98,7 @@ func NewConcurrencyLimiter() *ConcurrencyLimiter {
 	for index := range limiter.shards {
 		limiter.shards[index].counts = make(map[string]int)
 	}
+	limiter.indicesCache.New = func() any { return make([]int, 0, 256) }
 	return limiter
 }
 
@@ -135,10 +137,48 @@ func (l *ConcurrencyLimiter) Current(_ context.Context, key string) (int, error)
 
 func (l *ConcurrencyLimiter) CurrentMany(_ context.Context, keys []string) (map[string]int, error) {
 	values := make(map[string]int, len(keys))
+	if len(keys) == 0 {
+		return values, nil
+	}
+
+	// 选号会一次读取整个候选池。先按分片聚合下标，避免同一分片在一次快照中
+	// 被反复加锁数千次，并缩短高并发请求之间的锁竞争窗口。
+	var counts [shardCount]int
 	for _, key := range keys {
-		shard := &l.shards[shardIndex(key)]
+		counts[shardIndex(key)]++
+	}
+	var offsets [shardCount + 1]int
+	for index := range shardCount {
+		offsets[index+1] = offsets[index] + counts[index]
+	}
+	cursors := offsets
+	grouped := l.indicesCache.Get().([]int)
+	if cap(grouped) < len(keys) {
+		grouped = make([]int, len(keys))
+	} else {
+		grouped = grouped[:len(keys)]
+	}
+	defer func() {
+		// 不保留异常大的候选池缓冲，避免一次峰值长期占用进程内存。
+		if cap(grouped) <= maxEntries {
+			l.indicesCache.Put(grouped[:0])
+		}
+	}()
+	for keyIndex, key := range keys {
+		shard := int(shardIndex(key))
+		grouped[cursors[shard]] = keyIndex
+		cursors[shard]++
+	}
+	for shardIndex := range shardCount {
+		if offsets[shardIndex] == offsets[shardIndex+1] {
+			continue
+		}
+		shard := &l.shards[shardIndex]
 		shard.mu.Lock()
-		values[key] = shard.counts[key]
+		for _, keyIndex := range grouped[offsets[shardIndex]:offsets[shardIndex+1]] {
+			key := keys[keyIndex]
+			values[key] = shard.counts[key]
+		}
 		shard.mu.Unlock()
 	}
 	return values, nil
@@ -167,32 +207,54 @@ func NewStickyStore() *StickyStore {
 	return store
 }
 
-func (s *StickyStore) Get(_ context.Context, promptCacheKey string, now time.Time) (uint64, bool, error) {
-	shard := &s.shards[shardIndex(promptCacheKey)]
+func (s *StickyStore) Get(_ context.Context, affinityKey string, now time.Time) (uint64, bool, error) {
+	shard := &s.shards[shardIndex(affinityKey)]
 	shard.mu.Lock()
 	defer shard.mu.Unlock()
-	binding, ok := shard.bindings[promptCacheKey]
+	binding, ok := shard.bindings[affinityKey]
 	if !ok {
 		return 0, false, nil
 	}
 	if !now.Before(binding.expiresAt) {
-		delete(shard.bindings, promptCacheKey)
+		delete(shard.bindings, affinityKey)
 		return 0, false, nil
 	}
 	return binding.accountID, true, nil
 }
 
-func (s *StickyStore) Set(_ context.Context, promptCacheKey string, accountID uint64, expiresAt time.Time) error {
-	if promptCacheKey == "" {
-		return nil
+func (s *StickyStore) Bind(_ context.Context, affinityKey string, proposedAccountID uint64, now, expiresAt time.Time) (uint64, error) {
+	if affinityKey == "" || proposedAccountID == 0 || !now.Before(expiresAt) {
+		return proposedAccountID, nil
 	}
-	shard := &s.shards[shardIndex(promptCacheKey)]
+	shard := &s.shards[shardIndex(affinityKey)]
 	shard.mu.Lock()
 	defer shard.mu.Unlock()
-	shard.bindings[promptCacheKey] = stickyBinding{accountID: accountID, expiresAt: expiresAt}
+	if binding, ok := shard.bindings[affinityKey]; ok && now.Before(binding.expiresAt) {
+		binding.expiresAt = expiresAt
+		shard.bindings[affinityKey] = binding
+		return binding.accountID, nil
+	}
+	shard.bindings[affinityKey] = stickyBinding{accountID: proposedAccountID, expiresAt: expiresAt}
+	pruneStickyBindingsLocked(shard, now)
+	return proposedAccountID, nil
+}
+
+func (s *StickyStore) Set(_ context.Context, affinityKey string, accountID uint64, expiresAt time.Time) error {
+	if affinityKey == "" {
+		return nil
+	}
+	shard := &s.shards[shardIndex(affinityKey)]
+	shard.mu.Lock()
+	defer shard.mu.Unlock()
+	shard.bindings[affinityKey] = stickyBinding{accountID: accountID, expiresAt: expiresAt}
+	pruneStickyBindingsLocked(shard, time.Now())
+	return nil
+}
+
+func pruneStickyBindingsLocked(shard *stickyShard, now time.Time) {
 	if len(shard.bindings) > maxEntriesPerShard() {
 		for key, binding := range shard.bindings {
-			if time.Now().After(binding.expiresAt) {
+			if !now.Before(binding.expiresAt) {
 				delete(shard.bindings, key)
 			}
 		}
@@ -208,7 +270,6 @@ func (s *StickyStore) Set(_ context.Context, promptCacheKey string, accountID ui
 			delete(shard.bindings, oldestKey)
 		}
 	}
-	return nil
 }
 
 func (s *StickyStore) DeleteByAccount(_ context.Context, accountID uint64) error {
@@ -217,6 +278,29 @@ func (s *StickyStore) DeleteByAccount(_ context.Context, accountID uint64) error
 		shard.mu.Lock()
 		for key, binding := range shard.bindings {
 			if binding.accountID == accountID {
+				delete(shard.bindings, key)
+			}
+		}
+		shard.mu.Unlock()
+	}
+	return nil
+}
+
+func (s *StickyStore) DeleteByAccounts(_ context.Context, accountIDs []uint64) error {
+	ids := make(map[uint64]struct{}, len(accountIDs))
+	for _, accountID := range accountIDs {
+		if accountID != 0 {
+			ids[accountID] = struct{}{}
+		}
+	}
+	if len(ids) == 0 {
+		return nil
+	}
+	for index := range s.shards {
+		shard := &s.shards[index]
+		shard.mu.Lock()
+		for key, binding := range shard.bindings {
+			if _, remove := ids[binding.accountID]; remove {
 				delete(shard.bindings, key)
 			}
 		}

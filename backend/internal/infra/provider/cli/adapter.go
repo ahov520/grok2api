@@ -5,53 +5,84 @@ import (
 	"compress/gzip"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	"github.com/google/uuid"
+
 	"github.com/chenyme/grok2api/backend/internal/domain/account"
+	modeldomain "github.com/chenyme/grok2api/backend/internal/domain/model"
+	settingsdomain "github.com/chenyme/grok2api/backend/internal/domain/settings"
 	infraegress "github.com/chenyme/grok2api/backend/internal/infra/egress"
 	"github.com/chenyme/grok2api/backend/internal/infra/provider"
 	"github.com/chenyme/grok2api/backend/internal/infra/provider/conversation"
 	"github.com/chenyme/grok2api/backend/internal/infra/security"
+	"github.com/chenyme/grok2api/backend/internal/pkg/reasoningreplay"
 )
 
 type Config struct {
-	BaseURL          string
-	ClientVersion    string
-	ClientIdentifier string
-	TokenAuth        string
-	UserAgent        string
+	BaseURL               string
+	FallbackBaseURL       string
+	ClientVersion         string
+	ClientIdentifier      string
+	TokenAuth             string
+	UserAgent             string
+	ResponseHeaderTimeout time.Duration
 }
 
-// Adapter 实现 Grok Build CLI Responses、模型、Billing 与 OAuth 协议。
+const (
+	subscriptionTierTimeout = 10 * time.Second
+	buildControlTimeout     = 30 * time.Second
+)
+
+// Adapter implements the Grok Build CLI Responses, model, Billing, and OAuth protocols.
 type Adapter struct {
-	cfgMu      sync.RWMutex
-	cfg        Config
-	http       *http.Client
-	oauth      *oauthClient
-	cipher     *security.Cipher
-	base       http.RoundTripper
-	identityMu sync.Mutex
-	identities map[uint64]clientIdentity
-}
-
-type clientIdentity struct {
-	agentID   string
-	sessionID string
+	cfgMu          sync.RWMutex
+	cfg            Config
+	http           *http.Client
+	oauth          *oauthClient
+	cipher         *security.Cipher
+	base           *buildDirectTransport
+	agentID        string
+	modelsMu       sync.Mutex
+	modelsETags    map[uint64]string
+	fallbackMarker FallbackMarker
+	uploadIssuer   VideoUploadIssuer
+	replay         *reasoningreplay.ReasoningReplay
+	compaction     *gatewayCompactionCodec
+	logger         *slog.Logger
 }
 
 func NewAdapter(cfg Config, cipher *security.Cipher) *Adapter {
-	transport := &http.Transport{Proxy: http.ProxyFromEnvironment, ForceAttemptHTTP2: true, MaxIdleConns: 256, MaxIdleConnsPerHost: 128, MaxConnsPerHost: 256, IdleConnTimeout: 90 * time.Second, TLSHandshakeTimeout: 10 * time.Second, ResponseHeaderTimeout: 30 * time.Second}
+	cfg.ResponseHeaderTimeout = normalizeBuildResponseHeaderTimeout(cfg.ResponseHeaderTimeout)
+	transport := newBuildDirectTransport(cfg.ResponseHeaderTimeout)
 	httpClient := &http.Client{Transport: transport}
-	return &Adapter{cfg: cfg, http: httpClient, oauth: newOAuthClient(httpClient), cipher: cipher, base: transport, identities: make(map[uint64]clientIdentity)}
+	// The official CLI uses a persistent machine identity. The gateway does not collect machine fingerprints;
+	// instead each backend process generates one random UUID for its lifetime as the Agent identity.
+	agentID := uuid.NewString()
+	adapter := &Adapter{
+		cfg: cfg, http: httpClient, cipher: cipher, base: transport,
+		agentID: agentID, modelsETags: make(map[uint64]string), compaction: newGatewayCompactionCodec(cipher), logger: slog.Default(),
+	}
+	adapter.oauth = newOAuthClient(httpClient, func() string { return adapter.config().ClientVersion })
+	return adapter
+}
+
+func (a *Adapter) SetLogger(logger *slog.Logger) {
+	if logger != nil {
+		a.logger = logger
+	}
 }
 
 func (a *Adapter) SetEgress(manager *infraegress.Manager) {
@@ -60,12 +91,115 @@ func (a *Adapter) SetEgress(manager *infraegress.Manager) {
 	}
 }
 
+// SetReasoningReplay injects the optional server-side reasoning replay cache.
+func (a *Adapter) SetReasoningReplay(replay *reasoningreplay.ReasoningReplay) {
+	a.replay = replay
+}
+
 func (a *Adapter) Provider() account.Provider { return account.ProviderBuild }
 
+// CredentialMetadata extracts only non-sensitive risk flags from a Build access token.
+// bot_flag_source or its short alias bfs must be JSON number 1 or 2; other values, malformed
+// tokens, and decryption failures are not marked. bot_flag_source is preferred when both are set.
+func (a *Adapter) CredentialMetadata(credential account.Credential) provider.CredentialMetadata {
+	if credential.Provider != account.ProviderBuild || a.cipher == nil || credential.EncryptedAccessToken == "" {
+		return provider.CredentialMetadata{}
+	}
+	accessToken, err := a.cipher.Decrypt(credential.EncryptedAccessToken)
+	if err != nil {
+		return provider.CredentialMetadata{}
+	}
+	claims := decodeJWTClaims(accessToken)
+	if claims == nil {
+		return provider.CredentialMetadata{}
+	}
+	source := buildBotFlagSourceFromClaims(claims)
+	return provider.CredentialMetadata{
+		BuildBotFlagInspected: true,
+		BuildBotFlagged:       source != 0,
+		BuildBotFlagSource:    source,
+	}
+}
+
+// buildBotFlagSourceFromClaims returns the bot-risk source from JWT claims.
+// Accepts bot_flag_source or bfs; only JSON numbers 1 and 2 count (string "1"/"2" do not).
+// Prefer bot_flag_source when it is 1 or 2; otherwise fall back to bfs.
+func buildBotFlagSourceFromClaims(claims map[string]any) int {
+	if claims == nil {
+		return 0
+	}
+	if source := botFlagSourceClaim(claims, "bot_flag_source"); source != 0 {
+		return source
+	}
+	return botFlagSourceClaim(claims, "bfs")
+}
+
+func botFlagSourceClaim(claims map[string]any, key string) int {
+	value, ok := claims[key].(float64)
+	if !ok {
+		return 0
+	}
+	switch value {
+	case 1, 2:
+		return int(value)
+	default:
+		return 0
+	}
+}
+
+// buildBotFlaggedFromClaims reports whether JWT claims mark a Build account as bot-risked.
+func buildBotFlaggedFromClaims(claims map[string]any) bool {
+	return buildBotFlagSourceFromClaims(claims) != 0
+}
+
 func (a *Adapter) UpdateConfig(cfg Config) {
+	cfg.ResponseHeaderTimeout = normalizeBuildResponseHeaderTimeout(cfg.ResponseHeaderTimeout)
 	a.cfgMu.Lock()
+	previousTimeout := a.cfg.ResponseHeaderTimeout
 	a.cfg = cfg
 	a.cfgMu.Unlock()
+	if previousTimeout != cfg.ResponseHeaderTimeout && a.base != nil {
+		a.base.UpdateResponseHeaderTimeout(cfg.ResponseHeaderTimeout)
+	}
+}
+
+type buildDirectTransport struct {
+	current atomic.Pointer[http.Transport]
+}
+
+func newBuildDirectTransport(responseHeaderTimeout time.Duration) *buildDirectTransport {
+	value := &buildDirectTransport{}
+	value.current.Store(newBuildHTTPTransport(responseHeaderTimeout))
+	return value
+}
+
+func (t *buildDirectTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	return t.current.Load().RoundTrip(request)
+}
+
+func (t *buildDirectTransport) UpdateResponseHeaderTimeout(responseHeaderTimeout time.Duration) {
+	next := newBuildHTTPTransport(responseHeaderTimeout)
+	previous := t.current.Swap(next)
+	if previous != nil {
+		previous.CloseIdleConnections()
+	}
+}
+
+func newBuildHTTPTransport(responseHeaderTimeout time.Duration) *http.Transport {
+	return &http.Transport{
+		Proxy: http.ProxyFromEnvironment, ForceAttemptHTTP2: true,
+		MaxIdleConns: 256, MaxIdleConnsPerHost: 128, MaxConnsPerHost: 256,
+		IdleConnTimeout: 90 * time.Second, TLSHandshakeTimeout: 10 * time.Second,
+		ResponseHeaderTimeout: normalizeBuildResponseHeaderTimeout(responseHeaderTimeout),
+		ExpectContinueTimeout: time.Second,
+	}
+}
+
+func normalizeBuildResponseHeaderTimeout(value time.Duration) time.Duration {
+	if value <= 0 {
+		return settingsdomain.DefaultBuildResponseHeaderTimeout
+	}
+	return value
 }
 
 func (a *Adapter) config() Config {
@@ -82,11 +216,24 @@ func (a *Adapter) ForwardResponse(ctx context.Context, request provider.Response
 	body := request.Body
 	var toolCompatibility *responsesToolCompatibility
 	var conversationOptions conversation.ResponseOptions
+	cacheRoute := buildPromptCacheRoute{}
+	compactionRequested := false
 	if request.NormalizeBody {
 		if request.Operation == conversation.OperationChat || request.Operation == conversation.OperationMessages {
 			body, conversationOptions, err = conversation.ConvertRequestWithOptions(body, request.Model, request.Operation)
 		} else {
+			var foreignCompactions int
+			body, foreignCompactions, err = expandGatewayCompactionHistory(body, a.compaction, request.PromptCacheKey)
+			if err != nil {
+				return invalidResponsesResponse(err), nil
+			}
 			body, toolCompatibility, err = normalizeResponsesRequest(body, request.Model)
+			if toolCompatibility != nil {
+				compactionRequested = toolCompatibility.compactionRequested
+				if foreignCompactions > 0 {
+					toolCompatibility.addWarning("foreign_compaction_omitted")
+				}
+			}
 		}
 		if err != nil {
 			if request.Operation == conversation.OperationChat || request.Operation == conversation.OperationMessages {
@@ -94,31 +241,59 @@ func (a *Adapter) ForwardResponse(ctx context.Context, request provider.Response
 			}
 			return invalidResponsesResponse(err), nil
 		}
+		body, err = normalizeBuildRequest(body, request.Model)
+		if err != nil {
+			if request.Operation == conversation.OperationChat || request.Operation == conversation.OperationMessages {
+				return invalidConversationResponse(request.Operation, err), nil
+			}
+			return invalidResponsesResponse(err), nil
+		}
 	}
-	var bodyReader io.Reader
-	if len(body) > 0 {
-		bodyReader = bytes.NewReader(body)
+	if request.Operation == conversation.OperationMessages && conversationOptions.AnthropicWebSearch {
+		request.ReasoningReplayKey = ""
 	}
-	req, err := http.NewRequestWithContext(ctx, request.Method, a.url(request.Path), bodyReader)
-	if err != nil {
-		return nil, err
+	if compactionRequested {
+		body, err = prepareGatewayCompactionSample(body)
+		if err != nil {
+			return invalidResponsesResponse(err), nil
+		}
 	}
-	if err := a.applyHeaders(req, request.Credential, accessToken, request.Model, request.PromptCacheKey, true); err != nil {
-		return nil, err
+	if len(body) > 0 && request.Method == http.MethodPost {
+		if !compactionRequested {
+			allowClientTools := request.AllowClientToolCacheRoute || (account.RoutingCandidate{Credential: request.Credential, Billing: request.Billing}).IsKnownFreeBuild()
+			body, cacheRoute, err = prepareBuildPromptCacheRoute(body, request.Operation, request.Model, request.PromptCacheKey, allowClientTools)
+			if err != nil {
+				err = fmt.Errorf("准备 Build prompt cache 路由: %w", err)
+				if request.Operation == conversation.OperationChat || request.Operation == conversation.OperationMessages {
+					return invalidConversationResponse(request.Operation, err), nil
+				}
+				return invalidResponsesResponse(err), nil
+			}
+			body, err = injectPromptCacheKey(body, request.PromptCacheKey)
+			if err != nil {
+				err = fmt.Errorf("写入 prompt_cache_key: %w", err)
+				if request.Operation == conversation.OperationChat || request.Operation == conversation.OperationMessages {
+					return invalidConversationResponse(request.Operation, err), nil
+				}
+				return invalidResponsesResponse(err), nil
+			}
+		}
 	}
-	if len(body) > 0 {
-		req.Header.Set("Content-Type", "application/json")
+	if compactionRequested {
+		warnings := ""
+		if toolCompatibility != nil {
+			warnings = toolCompatibility.warningHeader()
+		}
+		return a.forwardGatewayCompaction(ctx, request, accessToken, body, warnings)
 	}
-	if request.Streaming {
-		req.Header.Set("Accept", "text/event-stream")
-		req.Header.Set("Accept-Encoding", "identity")
-	} else {
-		req.Header.Set("Accept", "application/json")
-	}
-	if request.IdempotencyID != "" {
-		req.Header.Set("Idempotency-Key", request.IdempotencyID)
-	}
-	resp, err := a.http.Do(req)
+	// Explicit mode wins; in auto mode only confirmed Super accounts with bot_flag_source/bfs in {1,2} default to XAI.
+	primaryBase := a.primaryBaseURL()
+	base := a.inferenceBaseForOperation(request.Credential, request.Billing, request.Method, request.Path)
+	// Cache affinity and reasoning replay use separate identities. Replay is also bound to the actual account and upstream plane,
+	// preventing opaque reasoning issued for one account or Build plane from reaching another scope.
+	replayBaseBody := body
+	body, replayKey := a.applyReasoningReplay(ctx, request, replayBaseBody, base)
+	resp, reqURL, err := a.doResponseRequest(ctx, request, accessToken, body, base)
 	if err != nil {
 		return nil, err
 	}
@@ -148,18 +323,93 @@ func (a *Adapter) ForwardResponse(ctx context.Context, request provider.Response
 			resp.Body = checkedBody
 		}
 	}
-	responsesOperation := request.Operation == "" || request.Operation == conversation.OperationResponses
+	resp, reqURL, reasoningRecovery := a.recoverReasoningDecodeFailure(ctx, request, accessToken, body, base, replayKey, resp, reqURL)
+	var recoveredPrimaryFailure *provider.DiagnosticResponse
+	// Only eligible operations probe XAI with an equivalent request after the Build primary explicitly returns 403.
+	if strings.EqualFold(base, primaryBase) && shouldProbeXAIInferenceFallback(request.Credential, request.Billing, request.Method, request.Path, resp.StatusCode) {
+		// Buffer the primary 403 body and replay it unchanged if fallback fails; never issue a second primary POST.
+		primaryBody, primaryTruncated, readErr := provider.ReadDiagnosticBody(resp.Body)
+		_ = resp.Body.Close()
+		if readErr != nil {
+			return nil, readErr
+		}
+		primaryResp := cloneBufferedResponse(resp, primaryBody, primaryTruncated)
+		if shouldSkipXAIFallback(primaryBody) {
+			resp = primaryResp
+		} else {
+			fallbackBase := a.fallbackBaseURL()
+			if fallbackBase != "" && !strings.EqualFold(fallbackBase, base) {
+				fallbackBody, fallbackReplayKey := a.applyReasoningReplay(ctx, request, replayBaseBody, fallbackBase)
+				fallbackCtx := infraegress.WithPhysicalCallStage(ctx, "plane_fallback")
+				fallbackResp, fallbackURL, fallbackErr := a.doResponseRequest(fallbackCtx, request, accessToken, fallbackBody, fallbackBase)
+				if fallbackErr == nil {
+					fallbackErr = normalizeGzipResponse(fallbackResp)
+				}
+				fallbackRecovery := reasoningRecoveryOutcome{}
+				if fallbackErr == nil {
+					fallbackResp, fallbackURL, fallbackRecovery = a.recoverReasoningDecodeFailure(ctx, request, accessToken, fallbackBody, fallbackBase, fallbackReplayKey, fallbackResp, fallbackURL)
+				}
+				if fallbackErr == nil && isHTTPSuccess(fallbackResp.StatusCode) {
+					recoveredPrimaryFailure = bufferedFailureDiagnostic(primaryResp, primaryBody, primaryTruncated)
+					a.activateBuildAPIFallback(ctx, &request.Credential)
+					resp, reqURL, base, body, replayKey = fallbackResp, fallbackURL, fallbackBase, fallbackBody, fallbackReplayKey
+					reasoningRecovery = reasoningRecovery.merge(fallbackRecovery)
+				} else {
+					if fallbackErr == nil {
+						_ = fallbackResp.Body.Close()
+					}
+					// Preserve the original primary 403 URL and buffered body without requesting the primary again.
+					resp = primaryResp
+				}
+			} else {
+				resp = primaryResp
+			}
+		}
+	}
+	var rateLimit *provider.RateLimitMetadata
+	var rateLimitDiagnostic *provider.DiagnosticResponse
+	if resp.StatusCode == http.StatusTooManyRequests {
+		body, truncated, readErr := provider.ReadDiagnosticBody(resp.Body)
+		_ = resp.Body.Close()
+		if readErr != nil {
+			return nil, readErr
+		}
+		resp.Body = io.NopCloser(bytes.NewReader(body))
+		resp.ContentLength = int64(len(body))
+		resp.Header.Set("Content-Length", strconv.Itoa(len(body)))
+		rateLimit = provider.RateLimitFromResponse(resp.StatusCode, resp.Header, body)
+		if truncated {
+			rateLimitDiagnostic = &provider.DiagnosticResponse{
+				StatusCode: resp.StatusCode, Status: resp.Status, Header: resp.Header.Clone(),
+				Body: append([]byte(nil), body...), BodyTruncated: true,
+			}
+		}
+	}
+	modelCatalogChanged := a.modelCatalogChanged(request.Credential.ID, resp.Header.Get("x-models-etag"))
+	// Capture or clear reasoning replay in the upstream Responses shape before protocol conversion.
+	if a.shouldCaptureReplay(request, resp, replayKey) {
+		resp.Body = a.replay.CaptureBody(resp.Body, request.Model, replayKey, request.Streaming, isCompactPath(request.Path))
+	}
+	// Replay must read the raw upstream output. Hide xAI native search subcalls from downstream clients
+	// only after capture wrapping has completed.
+	if isHTTPSuccess(resp.StatusCode) {
+		if err := filterBuildPromptCacheResponse(resp, request.Streaming, cacheRoute); err != nil {
+			return nil, err
+		}
+	}
+	responsesOperation := request.Operation == "" || request.Operation == conversation.OperationResponses || request.Operation == conversation.OperationCompaction
 	if responsesOperation && toolCompatibility != nil {
 		if warnings := toolCompatibility.warningHeader(); warnings != "" {
 			resp.Header.Set("X-Grok2API-Compatibility-Warnings", warnings)
 		}
 	}
-	if responsesOperation && toolCompatibility != nil && resp.StatusCode >= 200 && resp.StatusCode < 300 {
+	reasoningRecovery.appendWarnings(resp.Header)
+	if responsesOperation && resp.StatusCode >= 200 && resp.StatusCode < 300 {
 		if request.Streaming {
 			resp.Body = toolCompatibility.normalizeResponseStream(resp.Body)
 			resp.Header.Del("Content-Length")
 			resp.Header.Set("Content-Type", "text/event-stream")
-		} else {
+		} else if toolCompatibility != nil {
 			data, readErr := io.ReadAll(io.LimitReader(resp.Body, maxCompatibleResponseBytes+1))
 			_ = resp.Body.Close()
 			if readErr != nil {
@@ -183,27 +433,157 @@ func (a *Adapter) ForwardResponse(ctx context.Context, request provider.Response
 			resp.Header.Del("Content-Length")
 			resp.Header.Set("Content-Type", "text/event-stream")
 		} else {
-			data, readErr := io.ReadAll(io.LimitReader(resp.Body, (64<<20)+1))
+			var data []byte
+			var readErr error
+			var diagnosticTruncated bool
+			if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+				data, readErr = io.ReadAll(io.LimitReader(resp.Body, (64<<20)+1))
+			} else {
+				data, diagnosticTruncated, readErr = provider.ReadDiagnosticBody(resp.Body)
+			}
 			_ = resp.Body.Close()
 			if readErr != nil {
 				return nil, readErr
 			}
-			if len(data) > 64<<20 {
+			if resp.StatusCode >= 200 && resp.StatusCode < 300 && len(data) > 64<<20 {
 				return nil, fmt.Errorf("上游对话响应超过 64 MiB")
+			}
+			var diagnostic *provider.DiagnosticResponse
+			if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+				diagnostic = &provider.DiagnosticResponse{StatusCode: resp.StatusCode, Status: resp.Status, Header: resp.Header.Clone(), Body: data, BodyTruncated: diagnosticTruncated || rateLimitDiagnostic != nil}
 			}
 			converted, convertErr := conversation.ConvertResponseJSONWithOptions(data, request.Operation, conversationOptions)
 			if convertErr != nil {
-				return nil, convertErr
+				if diagnostic == nil {
+					return nil, convertErr
+				}
+				return &provider.Response{StatusCode: resp.StatusCode, Status: resp.Status, Header: diagnostic.Header.Clone(), Body: io.NopCloser(bytes.NewReader(data)), UpstreamURL: reqURL, Diagnostic: diagnostic, RecoveredPrimaryFailure: recoveredPrimaryFailure, RateLimit: rateLimit, ModelCatalogChanged: modelCatalogChanged}, nil
 			}
 			resp.Body = io.NopCloser(bytes.NewReader(converted))
 			resp.Header.Set("Content-Length", strconv.Itoa(len(converted)))
 			resp.Header.Set("Content-Type", "application/json")
+			return &provider.Response{StatusCode: resp.StatusCode, Status: resp.Status, Header: resp.Header.Clone(), Body: resp.Body, UpstreamURL: reqURL, Diagnostic: diagnostic, RecoveredPrimaryFailure: recoveredPrimaryFailure, RateLimit: rateLimit, ModelCatalogChanged: modelCatalogChanged}, nil
 		}
 	}
-	return &provider.Response{StatusCode: resp.StatusCode, Status: resp.Status, Header: resp.Header.Clone(), Body: resp.Body}, nil
+	return &provider.Response{StatusCode: resp.StatusCode, Status: resp.Status, Header: resp.Header.Clone(), Body: resp.Body, UpstreamURL: reqURL, Diagnostic: rateLimitDiagnostic, RecoveredPrimaryFailure: recoveredPrimaryFailure, RateLimit: rateLimit, ModelCatalogChanged: modelCatalogChanged}, nil
 }
 
-// invalidResponsesResponse 将本地协议校验错误转换为标准 OpenAI 错误响应，避免触发上游账号重试。
+func (a *Adapter) shouldCaptureReplay(request provider.ResponseResourceRequest, resp *http.Response, replayKey string) bool {
+	if a.replay == nil || !a.replay.Enabled() || resp == nil {
+		return false
+	}
+	if request.Method != http.MethodPost || strings.TrimSpace(replayKey) == "" {
+		return false
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return false
+	}
+	return true
+}
+
+func (a *Adapter) applyReasoningReplay(ctx context.Context, request provider.ResponseResourceRequest, body []byte, base string) ([]byte, string) {
+	if a.replay == nil || !a.replay.Enabled() || request.Method != http.MethodPost {
+		return body, ""
+	}
+	key := a.scopedReasoningReplayKey(request, base)
+	if key == "" {
+		return body, ""
+	}
+	if isCompactPath(request.Path) {
+		// compact does not inject history, but a successful request still clears old replay in the same scope.
+		return body, key
+	}
+	return a.replay.Apply(ctx, request.Model, key, body), key
+}
+
+func (a *Adapter) scopedReasoningReplayKey(request provider.ResponseResourceRequest, base string) string {
+	seed := strings.TrimSpace(request.ReasoningReplayKey)
+	if seed == "" || request.Credential.ID == 0 {
+		return ""
+	}
+	plane := "build"
+	if fallback := a.fallbackBaseURL(); fallback != "" && strings.EqualFold(strings.TrimRight(base, "/"), fallback) {
+		plane = "xai"
+	}
+	digest := sha256.Sum256([]byte(fmt.Sprintf("grok2api:reasoning-replay:v2:%s:%d:%s", seed, request.Credential.ID, plane)))
+	return hex.EncodeToString(digest[:])
+}
+
+func isCompactPath(path string) bool {
+	return strings.Contains(strings.ToLower(path), "compact")
+}
+
+func (a *Adapter) doResponseRequest(ctx context.Context, request provider.ResponseResourceRequest, accessToken string, body []byte, base string) (*http.Response, string, error) {
+	var bodyReader io.Reader
+	if len(body) > 0 {
+		bodyReader = bytes.NewReader(body)
+	}
+	requestCtx := infraegress.WithCredential(ctx, request.Credential)
+	if request.ForcedEgressNodeID != 0 {
+		requestCtx = infraegress.WithEgressNode(requestCtx, request.ForcedEgressNodeID)
+	}
+	plane := "build"
+	if fallback := a.fallbackBaseURL(); fallback != "" && strings.EqualFold(strings.TrimRight(base, "/"), fallback) {
+		plane = "xai"
+	}
+	requestCtx = infraegress.WithPhysicalCallPlane(requestCtx, plane)
+	req, err := http.NewRequestWithContext(requestCtx, request.Method, a.urlWithBase(base, request.Path), bodyReader)
+	if err != nil {
+		return nil, "", err
+	}
+	if err := a.applyHeaders(req, request.Credential, accessToken, request.Model, request.PromptCacheKey, true); err != nil {
+		return nil, "", err
+	}
+	applyGrokTurnIndexHeader(req, request.GrokTurnIndex)
+	if len(body) > 0 {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	if request.Streaming {
+		req.Header.Set("Accept", "text/event-stream")
+		req.Header.Set("Accept-Encoding", "identity")
+	} else {
+		req.Header.Set("Accept", "application/json")
+	}
+	if request.IdempotencyID != "" {
+		req.Header.Set("Idempotency-Key", request.IdempotencyID)
+	}
+	resp, err := a.http.Do(req)
+	if err != nil {
+		return nil, "", err
+	}
+	return resp, req.URL.String(), nil
+}
+
+// applyGrokTurnIndexHeader forwards a real client turn only when the request has a stable Grok session.
+func applyGrokTurnIndexHeader(request *http.Request, value string) {
+	if request.Header.Get("x-grok-session-id") == "" {
+		return
+	}
+	if turnIndex := normalizeGrokTurnIndex(value); turnIndex != "" {
+		request.Header.Set("x-grok-turn-idx", turnIndex)
+	}
+}
+
+// normalizeGrokTurnIndex accepts only non-negative decimal u64 values generated by an official client.
+// Empty or invalid values are omitted; the gateway never fabricates turns from history, tool loops, or compaction.
+func normalizeGrokTurnIndex(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" || len(value) > 20 {
+		return ""
+	}
+	for _, char := range value {
+		if char < '0' || char > '9' {
+			return ""
+		}
+	}
+	if _, err := strconv.ParseUint(value, 10, 64); err != nil {
+		return ""
+	}
+	return value
+}
+
+// invalidResponsesResponse converts local protocol validation errors to a standard OpenAI error response,
+// avoiding an upstream account retry.
 func invalidResponsesResponse(err error) *provider.Response {
 	code := "invalid_request"
 	param := ""
@@ -240,95 +620,208 @@ func invalidConversationResponse(operation string, err error) *provider.Response
 }
 
 func (a *Adapter) ListModels(ctx context.Context, credential account.Credential) ([]string, error) {
+	ctx, cancel := context.WithTimeout(ctx, buildControlTimeout)
+	defer cancel()
 	accessToken, err := a.cipher.Decrypt(credential.EncryptedAccessToken)
 	if err != nil {
 		return nil, err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, a.url("/models"), nil)
+	// Always request the model catalog from the Build primary; do not preemptively switch to XAI because 1.5 or Super entitlement is absent.
+	// NormalizeAccountModelCapabilities fills session-contract capabilities such
+	// as Composer and paid video entitlement locally.
+	models, status, err := a.listModelsAt(ctx, credential, accessToken, a.primaryBaseURL())
 	if err != nil {
 		return nil, err
 	}
+	if models != nil {
+		return models, nil
+	}
+	return nil, fmt.Errorf("上游模型接口返回 %d", status)
+}
+
+// NormalizeAccountModelCapabilities normalizes capabilities that the OAuth
+// session contract exposes independently of the account's sparse /models list.
+// Composer is available to Build OAuth sessions even though the live catalog can
+// return only grok-4.5. Super always includes video 1.5; Free and Unknown remove
+// video 1.5 exactly. BuildAPIFallback is ignored.
+func (a *Adapter) NormalizeAccountModelCapabilities(models []string, billing *account.Billing, credential account.Credential) []string {
+	super := account.IsBuildSuper(credential, billing)
+	composer := credential.Provider == account.ProviderBuild && credential.AuthType == account.AuthTypeOAuth
+	result := make([]string, 0, len(models)+2)
+	seen := make(map[string]struct{}, len(models)+2)
+	hasVideo15 := false
+	for _, model := range models {
+		model = strings.TrimSpace(model)
+		if model == "" {
+			continue
+		}
+		if _, exists := seen[model]; exists {
+			continue
+		}
+		if model == buildVideoModel {
+			if !super {
+				continue
+			}
+			hasVideo15 = true
+		}
+		seen[model] = struct{}{}
+		result = append(result, model)
+	}
+	if super && !hasVideo15 {
+		result = append(result, buildVideoModel)
+	}
+	if composer {
+		if _, exists := seen[modeldomain.GrokComposer25Fast]; !exists {
+			result = append(result, modeldomain.GrokComposer25Fast)
+		}
+	}
+	return result
+}
+
+type buildModelCatalogEntry struct {
+	ID      string `json:"id"`
+	Model   string `json:"model"`
+	ModelID string `json:"modelId"`
+	Hidden  bool   `json:"hidden"`
+	Meta    struct {
+		Model   string `json:"model"`
+		ModelID string `json:"modelId"`
+		Hidden  bool   `json:"hidden"`
+	} `json:"_meta"`
+}
+
+// modelIdentifier keeps the legacy top-level id authoritative and uses the
+// additional official Grok Build shapes only as fallbacks. This makes catalog
+// parsing additive: existing route IDs never change merely because model or
+// modelId metadata appears alongside id.
+func (e buildModelCatalogEntry) modelIdentifier() string {
+	if e.Hidden || e.Meta.Hidden {
+		return ""
+	}
+	return firstNonEmpty(e.ID, e.Model, e.ModelID, e.Meta.Model, e.Meta.ModelID)
+}
+
+func (a *Adapter) listModelsAt(ctx context.Context, credential account.Credential, accessToken, base string) ([]string, int, error) {
+	requestCtx := infraegress.WithCredential(ctx, credential)
+	req, err := http.NewRequestWithContext(requestCtx, http.MethodGet, a.urlWithBase(base, "/models"), nil)
+	if err != nil {
+		return nil, 0, err
+	}
 	if err := a.applyHeaders(req, credential, accessToken, "", "", false); err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	resp, err := a.http.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	if err := normalizeGzipResponse(resp); err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	defer resp.Body.Close()
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("上游模型接口返回 %d", resp.StatusCode)
+		return nil, resp.StatusCode, nil
 	}
 	var payload struct {
-		Data []struct {
-			ID string `json:"id"`
-		} `json:"data"`
+		Data []json.RawMessage `json:"data"`
 	}
 	if err := json.Unmarshal(body, &payload); err != nil {
-		return nil, err
+		return nil, resp.StatusCode, err
 	}
 	models := make([]string, 0, len(payload.Data))
-	for _, item := range payload.Data {
-		if item.ID != "" {
-			models = append(models, item.ID)
+	seen := make(map[string]struct{}, len(payload.Data))
+	for _, raw := range payload.Data {
+		var item buildModelCatalogEntry
+		if json.Unmarshal(raw, &item) != nil {
+			continue
 		}
+		identifier := item.modelIdentifier()
+		if identifier == "" {
+			continue
+		}
+		if _, exists := seen[identifier]; exists {
+			continue
+		}
+		seen[identifier] = struct{}{}
+		models = append(models, identifier)
 	}
-	return models, nil
+	a.recordModelsETag(credential.ID, resp.Header.Get("ETag"))
+	return models, resp.StatusCode, nil
+}
+
+func (a *Adapter) recordModelsETag(accountID uint64, etag string) {
+	etag = strings.TrimSpace(etag)
+	if etag == "" {
+		return
+	}
+	a.modelsMu.Lock()
+	if a.modelsETags == nil {
+		a.modelsETags = make(map[uint64]string)
+	}
+	a.modelsETags[accountID] = etag
+	a.modelsMu.Unlock()
+}
+
+func (a *Adapter) modelCatalogChanged(accountID uint64, etag string) bool {
+	etag = strings.TrimSpace(etag)
+	if etag == "" {
+		return false
+	}
+	a.modelsMu.Lock()
+	defer a.modelsMu.Unlock()
+	if a.modelsETags == nil {
+		a.modelsETags = make(map[uint64]string)
+	}
+	current := a.modelsETags[accountID]
+	if current == "" {
+		// After a process restart there is no in-memory catalog baseline. Let the Gateway perform one account-level
+		// /models sync; recordModelsETag establishes the baseline after success.
+		return true
+	}
+	return current != etag
 }
 
 func (a *Adapter) GetBilling(ctx context.Context, credential account.Credential) (account.Billing, error) {
+	ctx, cancel := context.WithTimeout(ctx, buildControlTimeout)
+	defer cancel()
 	accessToken, err := a.cipher.Decrypt(credential.EncryptedAccessToken)
 	if err != nil {
 		return account.Billing{}, err
 	}
-	monthly, err := a.getBilling(ctx, credential, accessToken, "")
+	billing, err := a.getBilling(ctx, credential, accessToken, "format=credits")
 	if err != nil {
 		return account.Billing{}, err
 	}
-	monthly.AccountID = credential.ID
-	if credits, creditsErr := a.getBilling(ctx, credential, accessToken, "format=credits"); creditsErr == nil {
-		monthly = mergeBillingSnapshots(monthly, credits)
+	// A weekly quota at 0% usage cannot distinguish Free from a newly activated paid plan.
+	// The official CLI uses /user?include=subscription for the live subscription tier, then falls back to the JWT tier.
+	if tier, tierErr := a.getSubscriptionTier(ctx, credential, accessToken); tierErr == nil && tier != "" {
+		billing.PlanName = tier
+	} else if billing.PlanCode == "" && billing.PlanName == "" {
+		billing.PlanName = subscriptionTierFromJWT(accessToken)
 	}
-	monthly.SyncedAt = time.Now().UTC()
-	return monthly, nil
-}
-
-// mergeBillingSnapshots 合并套餐 credits 与 /usage 使用的当前限额周期，周周期优先作为恢复时间。
-func mergeBillingSnapshots(monthly, credits account.Billing) account.Billing {
-	if monthly.PlanCode == "" {
-		monthly.PlanCode = credits.PlanCode
-	}
-	if monthly.PlanName == "" {
-		monthly.PlanName = credits.PlanName
-	}
-	monthly.OnDemandCap = credits.OnDemandCap
-	monthly.OnDemandUsed = credits.OnDemandUsed
-	monthly.PrepaidBalance = credits.PrepaidBalance
-	monthly.CreditUsagePercent = credits.CreditUsagePercent
-	monthly.IsUnifiedBillingUser = credits.IsUnifiedBillingUser
-	monthly.TopUpMethod = credits.TopUpMethod
-	monthly.UsagePeriodType = credits.UsagePeriodType
-	monthly.UsagePeriodStart = credits.UsagePeriodStart
-	monthly.UsagePeriodEnd = credits.UsagePeriodEnd
-	return monthly
+	billing.AccountID = credential.ID
+	billing.SyncedAt = time.Now().UTC()
+	return billing, nil
 }
 
 func (a *Adapter) RefreshCredential(ctx context.Context, credential account.Credential) (provider.RefreshedCredential, error) {
+	ctx, cancel := context.WithTimeout(ctx, buildControlTimeout)
+	defer cancel()
 	refreshToken, err := a.cipher.Decrypt(credential.EncryptedRefreshToken)
 	if err != nil {
-		return provider.RefreshedCredential{}, &provider.CredentialRefreshError{Code: "credential_decrypt_failed", Permanent: true, Cause: err}
+		// Decryption failures are usually temporary or mismatched local encryption keys and are recoverable;
+		// do not mark them permanent, or manual/batch refresh will never retry after the key is fixed.
+		// True permanent OAuth failures such as invalid_grant are returned by oauth.refresh with Permanent=true.
+		return provider.RefreshedCredential{}, &provider.CredentialRefreshError{Code: "credential_decrypt_failed", Message: "Stored refresh credential could not be decrypted", Permanent: false, Cause: err}
 	}
 	if strings.TrimSpace(refreshToken) == "" {
-		return provider.RefreshedCredential{}, &provider.CredentialRefreshError{Code: "missing_refresh_token", Permanent: true}
+		return provider.RefreshedCredential{}, &provider.CredentialRefreshError{Code: "missing_refresh_token", Message: "Refresh token is missing", Permanent: true}
 	}
-	tokens, err := a.oauth.refresh(ctx, refreshToken)
+	refreshCtx := infraegress.WithCredential(ctx, credential)
+	tokens, err := a.oauth.refresh(refreshCtx, refreshToken)
 	if err != nil {
 		return provider.RefreshedCredential{}, err
 	}
@@ -344,10 +837,14 @@ func (a *Adapter) RefreshCredential(ctx context.Context, credential account.Cred
 }
 
 func (a *Adapter) StartDeviceAuthorization(ctx context.Context) (provider.DeviceAuthorization, error) {
+	ctx, cancel := context.WithTimeout(ctx, buildControlTimeout)
+	defer cancel()
 	return a.oauth.startDevice(ctx)
 }
 
 func (a *Adapter) PollDeviceAuthorization(ctx context.Context, deviceCode string) (provider.CredentialSeed, error) {
+	ctx, cancel := context.WithTimeout(ctx, buildControlTimeout)
+	defer cancel()
 	tokens, err := a.oauth.pollDevice(ctx, deviceCode)
 	if err != nil {
 		return provider.CredentialSeed{}, err
@@ -368,38 +865,32 @@ func (a *Adapter) MarshalCredentials(values []provider.CredentialSeed) ([]byte, 
 
 func (a *Adapter) applyHeaders(req *http.Request, credential account.Credential, accessToken, model, promptCacheKey string, trace bool) error {
 	cfg := a.config()
-	identity, err := a.clientIdentity(credential.ID)
-	if err != nil {
-		return err
-	}
-	requestID, err := randomHex(16)
-	if err != nil {
-		return err
-	}
-	conversationID := strings.TrimSpace(promptCacheKey)
-	if conversationID == "" {
-		conversationID, err = randomHex(16)
-		if err != nil {
-			return err
-		}
-	}
 	req.Header.Set("Authorization", "Bearer "+accessToken)
 	req.Header.Set("X-XAI-Token-Auth", cfg.TokenAuth)
 	req.Header.Set("x-grok-client-version", cfg.ClientVersion)
 	req.Header.Set("x-grok-client-identifier", cfg.ClientIdentifier)
-	req.Header.Set("x-grok-client-surface", "tui")
-	req.Header.Set("x-grok-client-name", cfg.ClientIdentifier)
-	req.Header.Set("x-grok-agent-id", identity.agentID)
-	req.Header.Set("x-grok-session-id", identity.sessionID)
-	req.Header.Set("x-grok-conv-id", conversationID)
-	req.Header.Set("x-grok-req-id", requestID)
-	req.Header.Set("x-grok-conversation-id", conversationID)
-	req.Header.Set("x-grok-session-id-legacy", identity.sessionID)
-	req.Header.Set("x-grok-request-id", requestID)
-	if credential.UserID != "" {
-		req.Header.Set("x-userid", credential.UserID)
-	}
+	req.Header.Set("x-grok-client-mode", "headless")
+
 	if trace {
+		requestID := uuid.NewString()
+		// Set x-grok-conv-id and session-id only when a stable session exists.
+		// Never generate a random UUID per request; it breaks xAI session affinity and keeps cached_tokens at zero.
+		sessionID, err := grokSessionID(promptCacheKey)
+		if err != nil {
+			return err
+		}
+		req.Header.Set("x-authenticateresponse", "authenticate-response")
+		req.Header.Set("x-grok-agent-id", a.agentID)
+		if sessionID != "" {
+			req.Header.Set("x-grok-session-id", sessionID)
+			req.Header.Set("x-grok-conv-id", sessionID)
+		}
+		req.Header.Set("x-grok-req-id", requestID)
+		// The gateway cannot reliably recover the CLI prompt index from a stateless API request.
+		// The field is optional in the official protocol, so do not fabricate x-grok-turn-idx.
+		if credential.UserID != "" {
+			req.Header.Set("x-grok-user-id", credential.UserID)
+		}
 		traceID, traceErr := randomHex(16)
 		if traceErr != nil {
 			return traceErr
@@ -409,7 +900,13 @@ func (a *Adapter) applyHeaders(req *http.Request, credential account.Credential,
 			return spanErr
 		}
 		req.Header.Set("traceparent", "00-"+traceID+"-"+spanID+"-01")
-		req.Header.Set("tracestate", "")
+	} else {
+		if credential.UserID != "" {
+			req.Header.Set("x-userid", credential.UserID)
+		}
+		if credential.Email != "" {
+			req.Header.Set("x-email", credential.Email)
+		}
 	}
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Accept-Encoding", "gzip")
@@ -420,23 +917,33 @@ func (a *Adapter) applyHeaders(req *http.Request, credential account.Credential,
 	return nil
 }
 
-func (a *Adapter) clientIdentity(accountID uint64) (clientIdentity, error) {
-	a.identityMu.Lock()
-	defer a.identityMu.Unlock()
-	if value, ok := a.identities[accountID]; ok {
-		return value, nil
+// grokSessionID converts a stable session key to the upstream x-grok-conv-id.
+// An empty key returns an empty string; stateless requests never receive a random ID.
+func grokSessionID(promptCacheKey string) (string, error) {
+	key := strings.TrimSpace(promptCacheKey)
+	if key == "" {
+		return "", nil
 	}
-	agentID, err := randomHex(16)
-	if err != nil {
-		return clientIdentity{}, err
+	if parsed, err := uuid.Parse(key); err == nil {
+		return parsed.String(), nil
 	}
-	sessionID, err := randomUUID()
-	if err != nil {
-		return clientIdentity{}, err
+	return uuid.NewHash(sha256.New(), uuid.NameSpaceURL, []byte("grok2api:session:"+key), 8).String(), nil
+}
+
+func injectPromptCacheKey(body []byte, clientKey string) ([]byte, error) {
+	key := strings.TrimSpace(clientKey)
+	if key == "" {
+		return body, nil
 	}
-	value := clientIdentity{agentID: agentID, sessionID: sessionID}
-	a.identities[accountID] = value
-	return value, nil
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return nil, err
+	}
+	if payload == nil {
+		payload = make(map[string]json.RawMessage)
+	}
+	payload["prompt_cache_key"] = mustJSON(key)
+	return json.Marshal(payload)
 }
 
 func randomHex(bytesLength int) (string, error) {
@@ -445,17 +952,6 @@ func randomHex(bytesLength int) (string, error) {
 		return "", err
 	}
 	return hex.EncodeToString(value), nil
-}
-
-func randomUUID() (string, error) {
-	value := make([]byte, 16)
-	if _, err := rand.Read(value); err != nil {
-		return "", err
-	}
-	value[6] = (value[6] & 0x0f) | 0x40
-	value[8] = (value[8] & 0x3f) | 0x80
-	hexValue := hex.EncodeToString(value)
-	return hexValue[0:8] + "-" + hexValue[8:12] + "-" + hexValue[12:16] + "-" + hexValue[16:20] + "-" + hexValue[20:], nil
 }
 
 func normalizeGzipResponse(response *http.Response) error {
@@ -497,7 +993,8 @@ func (a *Adapter) getBilling(ctx context.Context, credential account.Credential,
 	if query != "" {
 		endpoint += "?" + query
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	requestCtx := infraegress.WithCredential(ctx, credential)
+	req, err := http.NewRequestWithContext(requestCtx, http.MethodGet, endpoint, nil)
 	if err != nil {
 		return account.Billing{}, err
 	}
@@ -520,4 +1017,33 @@ func (a *Adapter) getBilling(ctx context.Context, credential account.Credential,
 		return account.Billing{}, fmt.Errorf("上游 Billing 接口返回 %d", resp.StatusCode)
 	}
 	return parseBilling(body)
+}
+
+func (a *Adapter) getSubscriptionTier(ctx context.Context, credential account.Credential, accessToken string) (string, error) {
+	endpoint := a.url("/user") + "?include=subscription"
+	requestCtx, cancel := context.WithTimeout(infraegress.WithCredential(ctx, credential), subscriptionTierTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(requestCtx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return "", err
+	}
+	if err := a.applyHeaders(req, credential, accessToken, "", "", false); err != nil {
+		return "", err
+	}
+	resp, err := a.http.Do(req)
+	if err != nil {
+		return "", err
+	}
+	if err := normalizeGzipResponse(resp); err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return "", err
+	}
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("上游订阅接口返回 %d", resp.StatusCode)
+	}
+	return parseSubscriptionTier(body)
 }

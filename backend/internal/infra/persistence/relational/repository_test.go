@@ -32,7 +32,7 @@ func TestSchemaAndRepositoryConstraints(t *testing.T) {
 	}
 
 	accountRepo := NewAccountRepository(database)
-	value := account.Credential{Provider: account.ProviderBuild, Name: "first", UserID: "user-1", SourceKey: "source", EncryptedAccessToken: "encrypted-a", EncryptedRefreshToken: "encrypted-r", ExpiresAt: time.Now().Add(time.Hour), Enabled: true, AuthStatus: account.AuthStatusActive, Priority: 100, MaxConcurrent: 4}
+	value := account.Credential{Provider: account.ProviderWeb, AuthType: account.AuthTypeSSO, Name: "first", UserID: "user-1", SourceKey: "source", EncryptedAccessToken: "encrypted-a", EncryptedCloudflareCookie: "encrypted-cf", ExpiresAt: time.Now().Add(time.Hour), Enabled: true, AuthStatus: account.AuthStatusActive, Priority: 100, MaxConcurrent: 4}
 	created, wasCreated, err := accountRepo.UpsertByIdentity(context.Background(), value)
 	if err != nil || !wasCreated {
 		t.Fatalf("首次 upsert = %#v, %v, %v", created, wasCreated, err)
@@ -46,8 +46,9 @@ func TestSchemaAndRepositoryConstraints(t *testing.T) {
 	}
 	value.Name = "updated"
 	value.EncryptedAccessToken = "encrypted-new"
+	value.EncryptedCloudflareCookie = ""
 	updated, wasCreated, err := accountRepo.UpsertByIdentity(context.Background(), value)
-	if err != nil || wasCreated || updated.ID != created.ID || updated.Name != "updated" || updated.LastUsedAt == nil || updated.ObservedModel != "grok-observed" || updated.ObservedModelAt == nil {
+	if err != nil || wasCreated || updated.ID != created.ID || updated.Name != "updated" || updated.LastUsedAt == nil || updated.ObservedModel != "grok-observed" || updated.ObservedModelAt == nil || updated.EncryptedCloudflareCookie != "encrypted-cf" {
 		t.Fatalf("幂等 upsert = %#v, %v, %v", updated, wasCreated, err)
 	}
 }
@@ -170,12 +171,52 @@ func TestAccountRepositoryLinksWebAndBuildAccountsOnce(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	unlinkedIDs, err := repo.ListUnlinkedWebAccountIDs(ctx, 10)
+	unlinkedIDs, total, err := repo.ListUnlinkedWebAccountIDs(ctx, 0, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(unlinkedIDs) != 1 || unlinkedIDs[0] != unlinkedWeb.ID {
-		t.Fatalf("unlinked web ids = %#v", unlinkedIDs)
+	if total != 1 || len(unlinkedIDs) != 1 || unlinkedIDs[0] != unlinkedWeb.ID {
+		t.Fatalf("unlinked web ids = %#v, total = %d", unlinkedIDs, total)
+	}
+	nextUnlinkedIDs, nextTotal, err := repo.ListUnlinkedWebAccountIDs(ctx, unlinkedWeb.ID, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if nextTotal != 0 || len(nextUnlinkedIDs) != 0 {
+		t.Fatalf("next unlinked web ids = %#v, total = %d", nextUnlinkedIDs, nextTotal)
+	}
+	buildCandidates, err := repo.FilterMissingBuildConversionIDs(ctx, []uint64{web.ID, build.ID, unlinkedWeb.ID, 999_999})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(buildCandidates) != 3 || buildCandidates[0] != build.ID || buildCandidates[1] != unlinkedWeb.ID || buildCandidates[2] != 999_999 {
+		t.Fatalf("build conversion candidates = %#v", buildCandidates)
+	}
+	if _, _, err := repo.UpsertByIdentity(ctx, account.Credential{
+		Provider: account.ProviderConsole, AuthType: account.AuthTypeSSO, Name: "console", SourceKey: "console-" + web.SourceKey,
+		EncryptedAccessToken: testEncryptedToken, AuthStatus: account.AuthStatusActive,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	consoleCandidates, err := repo.ListMissingConsoleSyncAccounts(ctx, []uint64{web.ID, unlinkedWeb.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(consoleCandidates) != 1 || consoleCandidates[0].ID != unlinkedWeb.ID {
+		t.Fatalf("console sync candidates = %#v", consoleCandidates)
+	}
+	if _, err := repo.ListMissingConsoleSyncAccounts(ctx, []uint64{build.ID}); !errors.Is(err, repository.ErrNotFound) {
+		t.Fatalf("non-web console candidate error = %v", err)
+	}
+	if _, err := repo.ListMissingConsoleSyncAccounts(ctx, []uint64{web.ID, 999_999}); !errors.Is(err, repository.ErrNotFound) {
+		t.Fatalf("missing console candidate error = %v", err)
+	}
+	consoleBatch, consoleTotal, consoleSkipped, err := repo.ListMissingConsoleSyncBatch(ctx, 0, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if consoleTotal != 1 || consoleSkipped != 1 || len(consoleBatch) != 1 || consoleBatch[0].ID != unlinkedWeb.ID {
+		t.Fatalf("console sync batch = %#v, total = %d, skipped = %d", consoleBatch, consoleTotal, consoleSkipped)
 	}
 	otherBuild, _, err := repo.UpsertByIdentity(ctx, account.Credential{Provider: account.ProviderBuild, Name: "build-2", SourceKey: "build-2", EncryptedAccessToken: testEncryptedToken, AuthStatus: account.AuthStatusActive})
 	if err != nil {
@@ -290,19 +331,50 @@ func TestAccountRepositoryPersistsObservedBuildBillingFields(t *testing.T) {
 		t.Fatal(err)
 	}
 	now := time.Now().UTC()
+	onDemandEnabled := false
 	if err := repo.UpdateObservedModel(context.Background(), credential.ID, "grok-4.5-build-free", now); err != nil {
 		t.Fatal(err)
 	}
-	if err := repo.SaveBilling(context.Background(), account.Billing{AccountID: credential.ID, IsUnifiedBillingUser: true, TopUpMethod: "TOP_UP_METHOD_SAVED_PAYMENT_METHOD", UsagePeriodType: "USAGE_PERIOD_TYPE_WEEKLY", UsagePeriodStart: "2026-07-12T00:00:00Z", UsagePeriodEnd: "2026-07-19T00:00:00Z", History: []account.BillingHistoryEntry{{Year: 2026, Month: 6}}, SyncedAt: now}); err != nil {
+	if err := repo.UpdateObservedModel(context.Background(), credential.ID, "grok-4.5-build-free", now.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.SaveBilling(context.Background(), account.Billing{AccountID: credential.ID, IsUnifiedBillingUser: true, OnDemandEnabled: &onDemandEnabled, TopUpMethod: "TOP_UP_METHOD_SAVED_PAYMENT_METHOD", UsagePeriodType: "USAGE_PERIOD_TYPE_WEEKLY", UsagePeriodStart: "2026-07-12T00:00:00Z", UsagePeriodEnd: "2026-07-19T00:00:00Z", History: []account.BillingHistoryEntry{{Year: 2026, Month: 6}}, SyncedAt: now}); err != nil {
 		t.Fatal(err)
 	}
 	storedCredential, err := repo.Get(context.Background(), credential.ID)
 	if err != nil || storedCredential.ObservedModel != "grok-4.5-build-free" || storedCredential.ObservedModelAt == nil {
 		t.Fatalf("credential = %#v, err = %v", storedCredential, err)
 	}
+	if !storedCredential.ObservedModelAt.Equal(now) {
+		t.Fatalf("unchanged observed model refreshed early at %v, want %v", storedCredential.ObservedModelAt, now)
+	}
 	billing, err := repo.GetBilling(context.Background(), credential.ID)
-	if err != nil || !billing.IsUnifiedBillingUser || billing.TopUpMethod != "TOP_UP_METHOD_SAVED_PAYMENT_METHOD" || billing.UsagePeriodType != "USAGE_PERIOD_TYPE_WEEKLY" || billing.UsagePeriodEnd != "2026-07-19T00:00:00Z" || len(billing.History) != 1 {
+	if err != nil || !billing.IsUnifiedBillingUser || billing.OnDemandEnabled == nil || *billing.OnDemandEnabled || billing.TopUpMethod != "TOP_UP_METHOD_SAVED_PAYMENT_METHOD" || billing.UsagePeriodType != "USAGE_PERIOD_TYPE_WEEKLY" || billing.UsagePeriodEnd != "2026-07-19T00:00:00Z" || len(billing.History) != 1 {
 		t.Fatalf("billing = %#v, err = %v", billing, err)
+	}
+}
+
+func TestAccountRepositoryRejectsStaleObservedModelWrite(t *testing.T) {
+	database := openTestDatabase(t)
+	repo := NewAccountRepository(database)
+	credential, _, err := repo.UpsertByIdentity(context.Background(), account.Credential{Provider: account.ProviderBuild, Name: "observed-order", SourceKey: "observed-order", EncryptedAccessToken: testEncryptedToken, AuthStatus: account.AuthStatusActive})
+	if err != nil {
+		t.Fatal(err)
+	}
+	older := time.Now().UTC()
+	newer := older.Add(time.Minute)
+	if updated, err := repo.UpdateObservedModelIfNewer(context.Background(), credential.ID, "grok-newer", newer); err != nil || !updated {
+		t.Fatalf("newer observed model update = %v, err = %v", updated, err)
+	}
+	if updated, err := repo.UpdateObservedModelIfNewer(context.Background(), credential.ID, "grok-older", older); err != nil || updated {
+		t.Fatalf("stale observed model update = %v, err = %v", updated, err)
+	}
+	stored, err := repo.Get(context.Background(), credential.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.ObservedModel != "grok-newer" || stored.ObservedModelAt == nil || !stored.ObservedModelAt.Equal(newer) {
+		t.Fatalf("observed model after stale write = %q at %v", stored.ObservedModel, stored.ObservedModelAt)
 	}
 }
 
@@ -387,12 +459,24 @@ func TestFreshSchemaContract(t *testing.T) {
 			t.Fatalf("missing table for %T", model)
 		}
 	}
-	assertTableColumns(t, database, "provider_accounts", []string{"provider", "source_key", "auth_status"}, []string{"oidc_client_id", "expires_at", "encrypted_access_token", "encrypted_refresh_token"})
-	assertTableColumns(t, database, "account_credentials", []string{"account_id", "auth_type", "client_id", "encrypted_primary", "encrypted_refresh", "expires_at", "refresh_due_at", "last_refresh_at", "refresh_failures", "last_refresh_error"}, nil)
+	assertTableColumns(t, database, "provider_accounts", []string{"provider", "source_key", "auth_status", "build_api_fallback", "build_route_mode", "build_super_entitled"}, []string{"oidc_client_id", "expires_at", "encrypted_access_token", "encrypted_refresh_token"})
+	assertTableColumns(t, database, "account_credentials", []string{"account_id", "auth_type", "client_id", "encrypted_primary", "encrypted_refresh", "expires_at", "refresh_due_at", "last_refresh_at", "refresh_failures", "last_refresh_error_status", "last_refresh_error", "last_refresh_error_message", "last_refresh_error_response", "refresh_permanent"}, nil)
+	assertTableColumns(t, database, "web_account_profiles", []string{"account_id", "tier", "synced_at", "nsfw_enabled_at"}, nil)
 	assertTableColumns(t, database, "admin_sessions", nil, []string{"revoked_at"})
 	assertTableColumns(t, database, "account_model_capabilities", []string{"account_id", "upstream_model"}, []string{"provider", "synced_at"})
-	assertTableColumns(t, database, "request_audits", []string{"media_input_images", "media_output_images", "media_output_seconds"}, nil)
-	assertTableColumns(t, database, "response_ownership", []string{"response_id", "account_id", "client_key_id", "provider", "expires_at"}, []string{"parent_response_id", "model_route_id"})
+	assertTableColumns(t, database, "request_audits", []string{"media_input_images", "media_output_images", "media_output_seconds", "first_token_ms"}, nil)
+	assertTableColumns(t, database, "response_ownership", []string{"response_id", "account_id", "client_key_id", "model_route_id", "provider", "prompt_cache_key", "reasoning_replay_key", "expires_at"}, []string{"parent_response_id"})
+	assertTableColumns(t, database, "media_assets", []string{"expires_at"}, nil)
+	if !database.db.Migrator().HasIndex(&mediaAssetModel{}, "idx_media_assets_expires") {
+		t.Fatal("missing media asset expiry index")
+	}
+	var requestAuditSQL string
+	if err := database.db.Raw("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'request_audits'").Scan(&requestAuditSQL).Error; err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(requestAuditSQL, "chk_request_audits_first_token_ms") {
+		t.Fatalf("first-token observability metadata must not require a table-level CHECK: %s", requestAuditSQL)
+	}
 
 	var expiresNotNull int
 	if err := database.db.Raw("SELECT `notnull` FROM pragma_table_info('account_credentials') WHERE name = 'expires_at'").Scan(&expiresNotNull).Error; err != nil {

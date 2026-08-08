@@ -7,7 +7,7 @@ Grok2API 的 Go 后端，负责上游账号调度、协议转换、额度管理�
 - Go 1.26、Gin、GORM
 - SQLite / PostgreSQL
 - Memory / Redis
-- Grok Build OAuth 与 Grok Web SSO Provider
+- Grok Build OAuth、Grok Web SSO 与 Grok Console SSO Provider
 
 ## 本地运行
 
@@ -34,7 +34,9 @@ go run ./cmd/grok2api --config /path/to/config.yaml --listen 0.0.0.0:8000
 
 ## 配置与存储
 
-启动配置统一由根目录 `config.yaml` 管理，启动阶段字段见 [`config.example.yaml`](../config.example.yaml)。Provider、批量任务、路由、媒体容量、审计和客户端密钥默认限制由管理端设置页持久化并热加载。
+启动配置统一由根目录 `config.yaml` 管理，启动阶段字段见 [`config.example.yaml`](../config.example.yaml)。Provider、服务容量、批量任务、路由、媒体、审计和客户端密钥默认限制由管理端设置页持久化；除页面明确标记“重启生效”的字段外均会热加载。
+
+PostgreSQL DSN 也可通过非空的 `GROK2API_DATABASE_URL` 注入；它的优先级高于 YAML，并会自动将数据库驱动切换为 `postgres`。空值不覆盖 YAML，程序不会隐式读取通用的 `DATABASE_URL`。
 
 | 场景 | 数据库 | 运行态存储 |
 | --- | --- | --- |
@@ -43,7 +45,7 @@ go run ./cmd/grok2api --config /path/to/config.yaml --listen 0.0.0.0:8000
 
 关系型数据库保存账号、凭据、模型、额度、客户端密钥、审计和媒体任务；Redis 仅承载限流、并发租约、粘滞路由、分布式锁和事件通知。敏感凭据使用 `credentialEncryptionKey` 加密，该密钥必须长期保留且不得提交到版本库。
 
-可热加载的 Provider、批量任务并发、路由、审计、媒体和代理参数由管理端设置页维护；数据库驱动、监听地址、Redis、JWT 与加密密钥仍通过 YAML 配置并在启动时生效。
+运行设置与代理参数由管理端设置页维护；数据库驱动、监听地址、Redis、JWT 与加密密钥仍通过 YAML 配置并在启动时生效。
 
 ## 服务入口
 
@@ -69,6 +71,8 @@ internal/repository/ 持久化接口
 ```
 
 依赖方向保持为 Transport → Application → Domain，基础设施通过接口接入，不在领域层依赖 HTTP、数据库或具体 Provider。
+
+三个 Provider 通过声明式 Definition 和小型能力接口注册：Build 使用远程模型目录与 Billing，Web 使用按等级过滤的静态目录与上游额度窗口，Console 使用静态目录和无状态 Responses。Gateway 只根据能力声明完成路由与调度，不在通用 Handler 中拼装 Provider 私有请求。
 
 ## 验证
 

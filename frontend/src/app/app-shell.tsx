@@ -1,10 +1,10 @@
 import { zodResolver } from "@hookform/resolvers/zod";
-import { Box, ChevronDown, Eye, Image, KeyRound, Languages, LayoutDashboard, LogOut, Menu, MessageSquareText, Monitor, Moon, MoreHorizontal, Settings, Sun, Users, Video } from "lucide-react";
+import { Box, ChevronDown, Eye, Image, KeyRound, Languages, LayoutDashboard, LogOut, Menu, MessageSquareText, Monitor, Moon, MoreHorizontal, Settings, ShieldCheck, Sparkles, Sun, Users, Video } from "lucide-react";
 import { useTheme } from "next-themes";
 import { useState, type ReactNode } from "react";
 import { useForm } from "react-hook-form";
 import { useTranslation } from "react-i18next";
-import { Link, NavLink, Outlet } from "react-router-dom";
+import { Link, NavLink, Outlet, useLocation } from "react-router-dom";
 import { toast } from "sonner";
 import { z } from "zod";
 
@@ -18,6 +18,7 @@ import { useAuth } from "@/shared/auth/use-auth";
 import { GitHubMark } from "@/shared/components/github-mark";
 import { SiteFooter } from "@/shared/components/site-footer";
 import { cn } from "@/shared/lib/cn";
+import { CurrentVersionLabel } from "@/features/system/version-update";
 
 const navigation = [
   { href: "/dashboard", label: "nav.dashboard", icon: LayoutDashboard },
@@ -27,6 +28,8 @@ const navigation = [
   { href: "/gallery", label: "nav.gallery", icon: Image },
   { href: "/video-gallery", label: "nav.videoGallery", icon: Video },
   { href: "/request-audits", label: "nav.audits", icon: Eye },
+  { href: "/quality-guard", label: "nav.qualityGuard", icon: ShieldCheck },
+  { href: "/creative-console", label: "nav.creativeConsole", icon: Sparkles },
 ] as const;
 
 const documentation = [
@@ -60,10 +63,12 @@ const documentation = [
 export function AppShell() {
   const { t, i18n } = useTranslation();
   const { admin, logout, changePassword } = useAuth();
+  const location = useLocation();
   const { setTheme } = useTheme();
   const [mobileOpen, setMobileOpen] = useState(false);
   const [passwordOpen, setPasswordOpen] = useState(false);
   const [documentationOpen, setDocumentationOpen] = useState<Record<string, boolean>>({});
+  const isMediaWorkspace = ["/creative-console", "/gallery", "/video-gallery"].includes(location.pathname);
 
   const passwordSchema = z.object({
     currentPassword: z.string().min(1, t("errors.required")),
@@ -214,8 +219,9 @@ export function AppShell() {
     <div className="min-h-screen bg-background">
         <aside className="fixed inset-y-0 left-0 z-30 hidden h-screen w-[288px] flex-col overflow-hidden bg-sidebar px-4 py-6 lg:flex">
           <div className="flex h-7 shrink-0 items-center justify-between px-2.5">
-            <Link to="/dashboard" className="flex h-7 items-center text-base font-semibold text-foreground">
-              {t("appName")}
+            <Link to="/dashboard" className="flex h-7 items-baseline gap-2 text-base font-semibold text-foreground">
+              <span>{t("appName")}</span>
+              <CurrentVersionLabel />
             </Link>
             <Button variant="ghost" size="icon" className="size-7 text-muted-foreground [&_svg]:size-[15px]" asChild>
               <a href="https://github.com/chenyme/grok2api" target="_blank" rel="noreferrer" aria-label="GitHub">
@@ -228,19 +234,25 @@ export function AppShell() {
         </aside>
 
         <div className="flex min-h-screen flex-col lg:pl-[288px]">
-          <header className="flex h-12 items-center justify-between border-b px-4 lg:hidden">
+          <header className="sticky top-0 z-40 flex h-12 items-center justify-between border-b bg-background px-4 lg:hidden">
             <Sheet open={mobileOpen} onOpenChange={setMobileOpen}>
               <SheetTrigger asChild><Button variant="ghost" size="icon" className="size-8" aria-label={t("shell.openNavigation")}><Menu className="size-4" /></Button></SheetTrigger>
-              <SheetContent side="left" className="flex w-72 flex-col gap-0 bg-sidebar px-3 py-4 [&>button]:right-2 [&>button]:top-3.5 [&>button]:flex [&>button]:size-7 [&>button]:items-center [&>button]:justify-center [&>nav]:mt-5 [&>nav]:pr-1">
+              <SheetContent side="left" className="flex h-dvh max-h-dvh w-72 flex-col gap-0 overflow-hidden bg-sidebar px-3 py-4 [&>button]:right-2 [&>button]:top-3.5 [&>button]:flex [&>button]:size-7 [&>button]:items-center [&>button]:justify-center">
                 <SheetHeader className="h-7 shrink-0 px-2.5 text-left">
                   <SheetTitle className="flex h-7 items-center text-base">{t("appName")}</SheetTitle>
                   <SheetDescription className="sr-only">{t("shell.navigation")}</SheetDescription>
                 </SheetHeader>
-                {navigationContent}
-                <div className="relative z-10 mt-3 shrink-0 bg-sidebar pt-3">{accountControl}</div>
+                <nav className="mt-5 min-h-0 flex-1 overflow-y-auto overscroll-contain pr-1 pb-2" aria-label={t("shell.navigation")}>
+                  <div className="space-y-1">{navigationLinks()}</div>
+                  <div className="mt-7">
+                    <div className="px-2.5 pb-2 text-xs font-normal text-foreground">{t("nav.docs")}</div>
+                    <div className="space-y-1">{documentationLinks()}</div>
+                  </div>
+                </nav>
+                <div className="relative z-10 mt-3 shrink-0 border-t border-sidebar-border/60 bg-sidebar pt-3">{accountControl}</div>
               </SheetContent>
             </Sheet>
-            <span className="text-sm font-semibold">{t("appName")}</span>
+            <span className="flex items-baseline gap-2 text-sm font-semibold"><span>{t("appName")}</span><CurrentVersionLabel /></span>
             <Button variant="ghost" size="icon" className="size-8 text-muted-foreground hover:text-foreground" asChild>
               <a href="https://github.com/chenyme/grok2api" target="_blank" rel="noreferrer" aria-label="GitHub">
                 <GitHubMark />
@@ -248,10 +260,10 @@ export function AppShell() {
             </Button>
           </header>
 
-          <main className="mx-auto w-full max-w-[1280px] flex-1 px-5 py-8 sm:px-8 lg:py-20">
+          <main className={cn("mx-auto w-full max-w-[1280px] flex-1 px-5 sm:px-8", isMediaWorkspace ? "pt-8 pb-0 lg:pt-20" : "py-8 lg:py-20")}>
             <Outlet />
           </main>
-          <SiteFooter />
+          {!isMediaWorkspace ? <SiteFooter /> : null}
         </div>
 
       <Dialog open={passwordOpen} onOpenChange={setPasswordOpen}>

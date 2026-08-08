@@ -14,7 +14,9 @@ Thumbs.db
 /config.yaml
 /config.local.yaml
 /config.*.local.yaml
-/docs/rules/
+/docs/*
+/docs/rules/*
+/backend/docs/goal/
 *.har
 *.pcap
 *.pcapng
@@ -32,6 +34,10 @@ Thumbs.db
 *.coverprofile
 *.test
 
+# Python
+__pycache__/
+*.py[cod]
+
 # Frontend
 /.pnpm-store/
 /frontend/node_modules/
@@ -43,3 +49,4 @@ Thumbs.db
 /release/
 /.tmp/
 /tmp/
+/Dockerfile.local

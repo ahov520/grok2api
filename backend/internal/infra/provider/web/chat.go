@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -18,22 +19,28 @@ import (
 	"unicode/utf8"
 
 	"github.com/chenyme/grok2api/backend/internal/domain/account"
-	domainegress "github.com/chenyme/grok2api/backend/internal/domain/egress"
 	inferencedomain "github.com/chenyme/grok2api/backend/internal/domain/inference"
 	infraegress "github.com/chenyme/grok2api/backend/internal/infra/egress"
 	"github.com/chenyme/grok2api/backend/internal/infra/provider"
 	"github.com/chenyme/grok2api/backend/internal/infra/provider/conversation"
-	"github.com/chenyme/grok2api/backend/internal/repository"
+	"github.com/chenyme/grok2api/backend/internal/infra/provider/searchresult"
 )
 
 const webResponseTTL = 30 * 24 * time.Hour
+
+const maxDeferredSearchTextBytes = 8 << 20
+
+const maxTrackedServerTools = 1024
 
 var (
 	errWebAntiBot    = errors.New("Grok Web anti-bot rejection")
 	errWebUsageLimit = errors.New("Grok Web usage limit reached")
 )
 
-var grokRenderPattern = regexp.MustCompile(`(?s)<grok:render\s+card_id="([^"]+)"\s+card_type="([^"]+)"\s+type="([^"]+)"[^>]*>.*?</grok:render>`)
+var (
+	grokRenderPattern   = regexp.MustCompile(`(?s)<grok:render\s+card_id="([^"]+)"\s+card_type="([^"]+)"\s+type="([^"]+)"[^>]*>.*?</grok:render>`)
+	grokToolNamePattern = regexp.MustCompile(`(?is)<xai:tool_name>\s*(.*?)\s*</xai:tool_name>`)
+)
 
 type openAIRequest struct {
 	Model              string          `json:"model"`
@@ -64,30 +71,40 @@ type chatMessage struct {
 }
 
 type normalizedChatInput struct {
-	Prompt string
-	Images []string
+	Prompt      string
+	Attachments []chatAttachmentInput
+}
+
+type chatAttachmentInput struct {
+	Source   string
+	Filename string
+	Image    bool
 }
 
 type parsedChat struct {
-	ResponseID     string
-	ConversationID string
-	ParentID       string
-	Text           strings.Builder
-	Reasoning      strings.Builder
-	Images         []string
-	SearchSources  []map[string]any
-	Annotations    []map[string]any
-	sourceKeys     map[string]struct{}
-	serverToolKeys map[string]struct{}
-	cardCache      map[string]map[string]any
-	citationIndex  map[string]int
-	lastCitation   int
-	ServerTools    int64
-	InputTokens    int64
-	ToolCalls      []parsedToolCall
-	Tools          []any
-	ToolChoice     any
-	ParallelTools  bool
+	ResponseID      string
+	ConversationID  string
+	ParentID        string
+	Text            strings.Builder
+	upstreamText    strings.Builder
+	Reasoning       strings.Builder
+	Images          []string
+	SearchSources   []map[string]any
+	Annotations     []map[string]any
+	sourceKeys      map[string]struct{}
+	serverToolKeys  map[string]struct{}
+	webSearchKeys   map[string]struct{}
+	cardCache       map[string]map[string]any
+	moderatedImages map[string]struct{}
+	citationIndex   map[string]int
+	lastCitation    int
+	ServerTools     int64
+	WebSearchTools  int64
+	InputTokens     int64
+	ToolCalls       []parsedToolCall
+	Tools           []any
+	ToolChoice      any
+	ParallelTools   bool
 }
 
 func (a *Adapter) ForwardResponse(ctx context.Context, request provider.ResponseResourceRequest) (*provider.Response, error) {
@@ -132,7 +149,7 @@ func (a *Adapter) ForwardResponse(ctx context.Context, request provider.Response
 	spec, ok := Resolve(request.Model)
 	if ok && spec.ProtocolModel == "imagine-lite" && request.Operation == "chat" {
 		if len(tools.ResponseTools) > 0 {
-			return invalidImageRequest("grok-imagine-image 不支持 tools")
+			return invalidImageRequest("grok-imagine-image-lite 不支持 tools")
 		}
 		return a.forwardLiteChatCompletion(ctx, request, input, normalized, spec)
 	}
@@ -146,11 +163,19 @@ func (a *Adapter) ForwardResponse(ctx context.Context, request provider.Response
 	var parsed parsedChat
 	var previous *inferencedomain.WebResponseState
 	for attempt := 0; attempt < 2; attempt++ {
-		upstream, lease, currentPrevious, statsigTarget, openErr := a.openChat(ctx, request.Credential, input.PreviousResponseID, spec, normalized)
+		attemptCtx := ctx
+		if attempt > 0 {
+			attemptCtx = infraegress.WithPhysicalCallStage(ctx, "anti_bot_retry")
+		}
+		upstream, lease, currentPrevious, statsigTarget, openErr := a.openChat(attemptCtx, request.Credential, input.PreviousResponseID, spec, normalized, true)
 		if openErr != nil {
-			if errors.Is(openErr, errInvalidChatImage) {
+			if errors.Is(openErr, errInvalidChatAttachment) || errors.Is(openErr, errInvalidChatImage) || errors.Is(openErr, errInvalidChatFile) {
+				code := "invalid_attachment_input"
+				if errors.Is(openErr, errInvalidChatImage) {
+					code = "invalid_image_input"
+				}
 				return jsonProviderResponse(http.StatusBadRequest, map[string]any{"error": map[string]any{
-					"message": openErr.Error(), "type": "invalid_request_error", "code": "invalid_image_input",
+					"message": openErr.Error(), "type": "invalid_request_error", "code": code,
 				}}), nil
 			}
 			return nil, openErr
@@ -158,13 +183,39 @@ func (a *Adapter) ForwardResponse(ctx context.Context, request provider.Response
 		previous = currentPrevious
 		if upstream.StatusCode < 200 || upstream.StatusCode >= 300 {
 			if upstream.StatusCode == http.StatusForbidden {
-				if attempt == 0 && a.invalidateSignedStatsig(http.MethodPost, statsigTarget) {
-					a.releaseStatsigRetry(upstream, lease)
+				// Preserve definitive account-block signals before a Statsig retry can discard the first response.
+				body, readErr := io.ReadAll(io.LimitReader(upstream.Body, 4<<20))
+				_ = upstream.Body.Close()
+				if readErr != nil {
+					lease.Release()
+					return nil, readErr
+				}
+				if provider.IsDefinitiveAccountBlockBody(body) {
+					return &provider.Response{
+						StatusCode: upstream.StatusCode, Status: upstream.Status, Header: http.Header(upstream.Header),
+						UpstreamURL: responseUpstreamURL(upstream),
+						Body: &releaseBody{ReadCloser: io.NopCloser(bytes.NewReader(body)), release: func() {
+							lease.Release()
+						}},
+					}, nil
+				}
+				lease.InvalidateClearance()
+				if statsigTarget != "" && attempt == 0 && a.invalidateSignedStatsig(http.MethodPost, statsigTarget) {
+					lease.Release()
 					continue
 				}
+				return &provider.Response{
+					StatusCode: upstream.StatusCode, Status: upstream.Status, Header: http.Header(upstream.Header),
+					UpstreamURL: responseUpstreamURL(upstream),
+					Body: &releaseBody{ReadCloser: io.NopCloser(bytes.NewReader(body)), release: func() {
+						a.egress.Feedback(context.WithoutCancel(ctx), lease.NodeID, upstream.StatusCode, nil)
+						lease.Release()
+					}},
+				}, nil
 			}
 			return &provider.Response{
 				StatusCode: upstream.StatusCode, Status: upstream.Status, Header: http.Header(upstream.Header),
+				UpstreamURL: responseUpstreamURL(upstream),
 				Body: &releaseBody{ReadCloser: upstream.Body, release: func() {
 					a.egress.Feedback(context.WithoutCancel(ctx), lease.NodeID, upstream.StatusCode, nil)
 					lease.Release()
@@ -178,7 +229,7 @@ func (a *Adapter) ForwardResponse(ctx context.Context, request provider.Response
 				body := a.streamOpenAIResponse(ctx, prepared, lease, request.Credential, responseID, input.Model, request.Operation, normalized.Prompt, previous, tools, parallelTools, conversationOptions)
 				return &provider.Response{StatusCode: http.StatusOK, Status: "200 OK", Header: streamHeaders(), Body: body}, nil
 			}
-			if errors.Is(preflightErr, errWebAntiBot) && attempt == 0 && a.invalidateSignedStatsig(http.MethodPost, statsigTarget) {
+			if statsigTarget != "" && errors.Is(preflightErr, errWebAntiBot) && attempt == 0 && a.invalidateSignedStatsig(http.MethodPost, statsigTarget) {
 				a.releaseStatsigRetry(upstream, lease)
 				continue
 			}
@@ -193,7 +244,7 @@ func (a *Adapter) ForwardResponse(ctx context.Context, request provider.Response
 
 		currentParsed, consumeErr := consumeUpstream(upstream.Body, nil)
 		_ = upstream.Body.Close()
-		if errors.Is(consumeErr, errWebAntiBot) && attempt == 0 && a.invalidateSignedStatsig(http.MethodPost, statsigTarget) {
+		if statsigTarget != "" && errors.Is(consumeErr, errWebAntiBot) && attempt == 0 && a.invalidateSignedStatsig(http.MethodPost, statsigTarget) {
 			lease.Release()
 			continue
 		}
@@ -235,7 +286,9 @@ func (a *Adapter) releaseStatsigRetry(upstream *http.Response, lease *infraegres
 }
 
 func (a *Adapter) feedbackAntiBot(ctx context.Context, lease *infraegress.Lease, statsigTarget string) {
-	a.invalidateSignedStatsig(http.MethodPost, statsigTarget)
+	if statsigTarget != "" {
+		a.invalidateSignedStatsig(http.MethodPost, statsigTarget)
+	}
 	a.egress.Feedback(context.WithoutCancel(ctx), lease.NodeID, http.StatusForbidden, nil)
 }
 
@@ -256,6 +309,12 @@ func preflightUpstream(source io.ReadCloser) (io.ReadCloser, error) {
 					if errorValue, ok := root["error"].(map[string]any); ok {
 						return nil, webResponseError(errorValue)
 					}
+					if event, ok := root["event"].(map[string]any); ok {
+						if event["type"] == "error" {
+							return nil, gatewayEventError(event)
+						}
+						return &readerCloser{Reader: io.MultiReader(bytes.NewReader(prefetched.Bytes()), reader), closer: source}, nil
+					}
 					if result, ok := root["result"].(map[string]any); ok && (result["conversation"] != nil || result["response"] != nil) {
 						return &readerCloser{Reader: io.MultiReader(bytes.NewReader(prefetched.Bytes()), reader), closer: source}, nil
 					}
@@ -272,64 +331,8 @@ func preflightUpstream(source io.ReadCloser) (io.ReadCloser, error) {
 	return nil, fmt.Errorf("Grok Web 首个流事件超过安全检查上限")
 }
 
-func (a *Adapter) openChat(ctx context.Context, credential account.Credential, previousResponseID string, spec ModelSpec, input normalizedChatInput) (*http.Response, *infraegress.Lease, *inferencedomain.WebResponseState, string, error) {
-	cfg := a.config()
-	token, err := a.cipher.Decrypt(credential.EncryptedAccessToken)
-	if err != nil {
-		return nil, nil, nil, "", err
-	}
-	lease, err := a.egress.Acquire(ctx, domainegress.ScopeWeb, fmt.Sprintf("%d", credential.ID))
-	if err != nil {
-		return nil, nil, nil, "", err
-	}
-	mode := spec.Mode
-	endpoint := cfg.BaseURL + "/rest/app-chat/conversations/new"
-	var previous *inferencedomain.WebResponseState
-	if previousResponseID != "" {
-		state, stateErr := a.states.GetWebState(ctx, previousResponseID, time.Now().UTC())
-		if stateErr != nil {
-			lease.Release()
-			if errors.Is(stateErr, repository.ErrNotFound) {
-				return nil, nil, nil, "", fmt.Errorf("previous_response_id 不存在或已过期")
-			}
-			return nil, nil, nil, "", stateErr
-		}
-		if state.AccountID != credential.ID {
-			lease.Release()
-			return nil, nil, nil, "", fmt.Errorf("previous_response_id 绑定的账号不一致")
-		}
-		previous = &state
-		endpoint = cfg.BaseURL + "/rest/app-chat/conversations/" + url.PathEscape(state.ConversationID) + "/responses"
-	}
-	attachments, err := a.prepareChatAttachments(ctx, cfg, lease, token, input.Images)
-	if err != nil {
-		lease.Release()
-		return nil, nil, nil, "", err
-	}
-	payload := buildWebChatPayload(input.Prompt, mode, attachments)
-	if previous != nil {
-		payload["responseId"] = previous.UpstreamParentResponseID
-	}
-	data, _ := json.Marshal(payload)
-	requestCtx, cancel := context.WithTimeout(ctx, time.Duration(cfg.ChatTimeoutSeconds)*time.Second)
-	request, err := http.NewRequestWithContext(requestCtx, http.MethodPost, endpoint, bytes.NewReader(data))
-	if err != nil {
-		cancel()
-		lease.Release()
-		return nil, nil, nil, "", err
-	}
-	request.Header = buildHeaders(token, lease, "application/json")
-	applyAppHeaders(request.Header, cfg.BaseURL, cfg.BaseURL+"/")
-	a.applySignedStatsig(requestCtx, request, token, lease)
-	response, err := lease.Do(request)
-	if err != nil {
-		cancel()
-		a.egress.Feedback(context.WithoutCancel(ctx), lease.NodeID, 0, err)
-		lease.Release()
-		return nil, nil, nil, "", err
-	}
-	response.Body = &cancelBody{ReadCloser: response.Body, cancel: cancel}
-	return response, lease, previous, endpoint, nil
+func (a *Adapter) openChat(ctx context.Context, credential account.Credential, previousResponseID string, spec ModelSpec, input normalizedChatInput, enforceStreamIdle bool) (*http.Response, *infraegress.Lease, *inferencedomain.WebResponseState, string, error) {
+	return a.openGatewayChat(ctx, credential, previousResponseID, spec, input, enforceStreamIdle)
 }
 
 func (a *Adapter) handleResponseResource(ctx context.Context, request provider.ResponseResourceRequest) (*provider.Response, error) {
@@ -370,6 +373,13 @@ func (a *Adapter) streamOpenAIResponse(ctx context.Context, source io.ReadCloser
 			sieve = newToolStreamSieve(tools.available)
 		}
 		messagesStream := newWebMessagesStream(writer, responseID, model, parsed.InputTokens, options)
+		visiblePhase := webVisibleStreamPhase{}
+		writeDelta := func(kind, delta string) error {
+			if !visiblePhase.Allow(kind, delta) {
+				return nil
+			}
+			return writeWebStreamDelta(writer, messagesStream, operation, responseID, model, kind, delta)
+		}
 		if operation != conversation.OperationMessages {
 			writeStreamStart(writer, operation, responseID, model, parsed.InputTokens)
 		}
@@ -395,14 +405,14 @@ func (a *Adapter) streamOpenAIResponse(ctx context.Context, source io.ReadCloser
 				result := sieve.Feed(delta)
 				if result.SafeText != "" {
 					clientText.WriteString(result.SafeText)
-					if err := writeWebStreamDelta(writer, messagesStream, operation, responseID, model, kind, result.SafeText); err != nil {
+					if err := writeDelta(kind, result.SafeText); err != nil {
 						return err
 					}
 				}
 				if result.Complete {
 					if len(result.Calls) == 0 {
 						clientText.WriteString(result.Raw)
-						return writeWebStreamDelta(writer, messagesStream, operation, responseID, model, kind, result.Raw)
+						return writeDelta(kind, result.Raw)
 					}
 					parsed.ToolCalls = result.Calls
 					return writeWebStreamToolCalls(writer, messagesStream, operation, responseID, model, result.Calls)
@@ -412,7 +422,7 @@ func (a *Adapter) streamOpenAIResponse(ctx context.Context, source io.ReadCloser
 			if kind == "text" {
 				clientText.WriteString(delta)
 			}
-			return writeWebStreamDelta(writer, messagesStream, operation, responseID, model, kind, delta)
+			return writeDelta(kind, delta)
 		})
 		if err != nil {
 			a.egress.Feedback(context.WithoutCancel(ctx), lease.NodeID, 0, err)
@@ -423,7 +433,7 @@ func (a *Adapter) streamOpenAIResponse(ctx context.Context, source io.ReadCloser
 			result := sieve.Flush()
 			if result.SafeText != "" {
 				clientText.WriteString(result.SafeText)
-				if err := writeWebStreamDelta(writer, messagesStream, operation, responseID, model, "text", result.SafeText); err != nil {
+				if err := writeDelta("text", result.SafeText); err != nil {
 					_ = writer.CloseWithError(err)
 					return
 				}
@@ -451,7 +461,7 @@ func (a *Adapter) streamOpenAIResponse(ctx context.Context, source io.ReadCloser
 					delta = "\n\n" + delta
 				}
 				clientText.WriteString(delta)
-				if err := writeWebStreamDelta(writer, messagesStream, operation, responseID, model, "text", delta); err != nil {
+				if err := writeDelta("text", delta); err != nil {
 					_ = writer.CloseWithError(err)
 					return
 				}
@@ -518,7 +528,7 @@ func normalizeOpenAIInput(input openAIRequest, operation string) (normalizedChat
 		return normalizedChatInput{}, errors.New("messages 不能为空")
 	}
 	var builder strings.Builder
-	images := make([]string, 0, 2)
+	attachments := make([]chatAttachmentInput, 0, 2)
 	for _, message := range messages {
 		typeName := strings.ToLower(strings.TrimSpace(message.Type))
 		if typeName == "function_call" {
@@ -548,11 +558,11 @@ func normalizeOpenAIInput(input openAIRequest, operation string) (normalizedChat
 			builder.WriteString("\n\n")
 			continue
 		}
-		text, messageImages, err := contentTextAndImages(message.Content)
+		text, messageAttachments, err := contentTextAndAttachments(message.Content)
 		if err != nil {
 			return normalizedChatInput{}, err
 		}
-		images = append(images, messageImages...)
+		attachments = append(attachments, messageAttachments...)
 		if len(message.ToolCalls) > 0 {
 			xml := toolCallsToXML(message.ToolCalls)
 			if text != "" && xml != "" {
@@ -574,13 +584,13 @@ func normalizeOpenAIInput(input openAIRequest, operation string) (normalizedChat
 		builder.WriteString("\n\n")
 	}
 	value := strings.TrimSpace(builder.String())
-	if value == "" && len(images) == 0 {
-		return normalizedChatInput{}, errors.New("消息中没有可发送的文本或图片")
+	if value == "" && len(attachments) == 0 {
+		return normalizedChatInput{}, errors.New("消息中没有可发送的文本或附件")
 	}
-	if len(images) > maxChatImageAttachments {
-		return normalizedChatInput{}, fmt.Errorf("单次对话最多支持 %d 张图片", maxChatImageAttachments)
+	if len(attachments) > maxChatAttachments {
+		return normalizedChatInput{}, fmt.Errorf("单次对话最多支持 %d 个附件", maxChatAttachments)
 	}
-	return normalizedChatInput{Prompt: value, Images: images}, nil
+	return normalizedChatInput{Prompt: value, Attachments: attachments}, nil
 }
 
 func rawTextValue(raw json.RawMessage) (string, error) {
@@ -598,7 +608,7 @@ func rawTextValue(raw json.RawMessage) (string, error) {
 	return string(trimmed), nil
 }
 
-func contentTextAndImages(raw json.RawMessage) (string, []string, error) {
+func contentTextAndAttachments(raw json.RawMessage) (string, []chatAttachmentInput, error) {
 	trimmed := bytes.TrimSpace(raw)
 	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
 		return "", nil, nil
@@ -615,7 +625,7 @@ func contentTextAndImages(raw json.RawMessage) (string, []string, error) {
 		return "", nil, errors.New("消息 content 必须是字符串或内容数组")
 	}
 	values := make([]string, 0, len(parts))
-	images := make([]string, 0, 2)
+	attachments := make([]chatAttachmentInput, 0, 2)
 	for _, part := range parts {
 		typeName, _ := part["type"].(string)
 		switch typeName {
@@ -625,19 +635,49 @@ func contentTextAndImages(raw json.RawMessage) (string, []string, error) {
 			}
 		case "image_url", "input_image", "image":
 			if value := extractImageURL(part); value != "" {
-				images = append(images, value)
+				attachments = append(attachments, chatAttachmentInput{Source: value, Image: true})
 			} else if fileID, _ := part["file_id"].(string); fileID != "" {
 				return "", nil, errors.New("Grok Web 对话暂不支持 input_image.file_id，请使用 image_url 或 Base64 data URI")
 			} else {
 				return "", nil, errors.New("图片内容缺少 image_url")
 			}
-		case "input_audio", "file", "input_file":
-			return "", nil, fmt.Errorf("Grok Web 对话暂不支持 %s 内容", typeName)
+		case "file", "input_file":
+			attachment, err := extractFileAttachment(part)
+			if err != nil {
+				return "", nil, err
+			}
+			attachments = append(attachments, attachment)
+		case "input_audio":
+			return "", nil, errors.New("Grok Web 对话暂不支持 input_audio 内容")
 		default:
 			return "", nil, fmt.Errorf("Grok Web 对话暂不支持 content.type=%q", typeName)
 		}
 	}
-	return strings.Join(values, "\n"), images, nil
+	return strings.Join(values, "\n"), attachments, nil
+}
+
+func extractFileAttachment(part map[string]any) (chatAttachmentInput, error) {
+	value := part
+	if nested, _ := part["file"].(map[string]any); nested != nil {
+		value = nested
+	}
+	if fileID, _ := value["file_id"].(string); strings.TrimSpace(fileID) != "" {
+		return chatAttachmentInput{}, errors.New("Grok Web 对话暂不支持 input_file.file_id，请使用 file_url 或 file_data")
+	}
+	fileURL, _ := value["file_url"].(string)
+	fileData, _ := value["file_data"].(string)
+	if strings.TrimSpace(fileURL) != "" && strings.TrimSpace(fileData) != "" {
+		return chatAttachmentInput{}, errors.New("input_file 不能同时提供 file_url 和 file_data")
+	}
+	source := strings.TrimSpace(fileURL)
+	if source == "" {
+		source = strings.TrimSpace(fileData)
+	}
+	if source == "" {
+		return chatAttachmentInput{}, errors.New("input_file 缺少 file_url 或 file_data")
+	}
+	filename, _ := value["filename"].(string)
+	return chatAttachmentInput{Source: source, Filename: strings.TrimSpace(filename)}, nil
 }
 
 func extractImageURL(part map[string]any) string {
@@ -650,23 +690,6 @@ func extractImageURL(part map[string]any) string {
 		return text
 	}
 	return ""
-}
-
-func buildWebChatPayload(message, mode string, attachments []string) map[string]any {
-	if attachments == nil {
-		attachments = []string{}
-	}
-	return map[string]any{
-		"collectionIds": []any{}, "disabledConnectorIds": []any{},
-		"deviceEnvInfo": map[string]any{"darkModeEnabled": false, "devicePixelRatio": 2, "screenHeight": 1328, "screenWidth": 2056, "viewportHeight": 1083, "viewportWidth": 2056},
-		"disableMemory": true, "disableSearch": false, "disableSelfHarmShortCircuit": false,
-		"disableTextFollowUps": false, "enableImageGeneration": true, "enableImageStreaming": true,
-		"enableSideBySide": true, "fileAttachments": attachments, "forceConcise": false,
-		"forceSideBySide": false, "imageAttachments": []any{}, "imageGenerationCount": 2,
-		"isAsyncChat": false, "message": message, "modeId": mode, "responseMetadata": map[string]any{},
-		"returnImageBytes": false, "returnRawGrokInXaiRequest": false,
-		"sendFinalMetadata": true, "temporary": true,
-	}
 }
 
 func consumeUpstream(source io.Reader, emit func(string, string) error) (parsedChat, error) {
@@ -751,6 +774,9 @@ func parseUpstreamFrame(data []byte, parsed *parsedChat) (string, string, error)
 	if json.Unmarshal(data, &root) != nil {
 		return "", "", nil
 	}
+	if event, ok := root["event"].(map[string]any); ok {
+		return parseGatewayEvent(event, parsed)
+	}
 	if errorValue, ok := root["error"].(map[string]any); ok {
 		return "", "", webResponseError(errorValue)
 	}
@@ -784,20 +810,21 @@ func parseUpstreamFrame(data []byte, parsed *parsedChat) (string, string, error)
 	tag, _ := response["messageTag"].(string)
 	if tag == "tool_usage_card" {
 		collectServerTool(parsed, response)
+		// tool_usage_card 的 token 是 Grok 内部 XML 协议，不属于模型 reasoning。
+		return "", "", nil
 	}
 	if token != "" && thinking {
 		parsed.Reasoning.WriteString(token)
 		return "reasoning", token, nil
 	}
 	if token != "" && !thinking && (tag == "final" || tag == "") {
+		parsed.upstreamText.WriteString(token)
 		cleaned := cleanChatToken(parsed, token)
 		parsed.Text.WriteString(cleaned)
 		return "text", cleaned, nil
 	}
 	if modelResponse, _ := response["modelResponse"].(map[string]any); modelResponse != nil {
-		if first := collectModelResponseImages(parsed, modelResponse); first != "" {
-			return "image", first, nil
-		}
+		return collectModelResponse(parsed, modelResponse)
 	}
 	if imageResponse, _ := response["streamingImageGenerationResponse"].(map[string]any); imageResponse != nil {
 		rawURL, _ := imageResponse["imageUrl"].(string)
@@ -805,6 +832,11 @@ func parseUpstreamFrame(data []byte, parsed *parsedChat) (string, string, error)
 			rawURL, _ = imageResponse["url"].(string)
 		}
 		if rawURL != "" {
+			moderated, _ := imageResponse["moderated"].(bool)
+			if moderated {
+				markModeratedImage(parsed, rawURL)
+				return "", "", nil
+			}
 			completed, _ := imageResponse["isFinal"].(bool)
 			if completed || imageResponse["progress"] == float64(100) {
 				rawURL = absoluteAssetURL(rawURL)
@@ -814,6 +846,64 @@ func parseUpstreamFrame(data []byte, parsed *parsedChat) (string, string, error)
 		}
 	}
 	return "", "", nil
+}
+
+func collectModelResponse(parsed *parsedChat, modelResponse map[string]any) (string, string, error) {
+	if err := modelResponseStreamError(modelResponse); err != nil {
+		return "", "", err
+	}
+	if parsed.ParentID == "" {
+		parsed.ParentID, _ = modelResponse["parentResponseId"].(string)
+	}
+	collectSearchSources(parsed, modelResponse)
+	firstImage := collectModelResponseImages(parsed, modelResponse)
+	message, _ := modelResponse["message"].(string)
+	if delta := mergeModelResponseText(parsed, message); delta != "" {
+		return "text", delta, nil
+	}
+	if firstImage != "" {
+		return "image", firstImage, nil
+	}
+	return "", "", nil
+}
+
+func mergeModelResponseText(parsed *parsedChat, message string) string {
+	if message == "" {
+		return ""
+	}
+	raw := parsed.upstreamText.String()
+	if raw == message || strings.HasPrefix(raw, message) {
+		return ""
+	}
+	if raw != "" && !strings.HasPrefix(message, raw) {
+		// 已输出内容与最终 envelope 不同，保留已输出结果，避免重复或回滚流式内容。
+		return ""
+	}
+	delta := message[len(raw):]
+	parsed.upstreamText.WriteString(delta)
+	delta = cleanChatToken(parsed, delta)
+	parsed.Text.WriteString(delta)
+	return delta
+}
+
+func modelResponseStreamError(modelResponse map[string]any) error {
+	values, _ := modelResponse["streamErrors"].([]any)
+	for _, raw := range values {
+		switch value := raw.(type) {
+		case string:
+			if message := strings.TrimSpace(value); message != "" {
+				return errors.New(message)
+			}
+		case map[string]any:
+			if nested, _ := value["error"].(map[string]any); nested != nil {
+				return webResponseError(nested)
+			}
+			if message := firstString(value, "message", "error", "detail"); message != "" {
+				return webResponseError(map[string]any{"message": message, "code": value["code"]})
+			}
+		}
+	}
+	return nil
 }
 
 func webResponseError(value map[string]any) error {
@@ -846,6 +936,9 @@ func collectModelResponseImages(parsed *parsedChat, modelResponse map[string]any
 			return
 		}
 		value = absoluteAssetURL(value)
+		if _, moderated := parsed.moderatedImages[value]; moderated {
+			return
+		}
 		if containsString(parsed.Images, value) {
 			return
 		}
@@ -873,48 +966,77 @@ func collectModelResponseImages(parsed *parsedChat, modelResponse map[string]any
 	return first
 }
 
+func markModeratedImage(parsed *parsedChat, value string) {
+	if strings.TrimSpace(value) == "" {
+		return
+	}
+	if parsed.moderatedImages == nil {
+		parsed.moderatedImages = make(map[string]struct{})
+	}
+	parsed.moderatedImages[absoluteAssetURL(value)] = struct{}{}
+}
+
 func collectSearchSources(parsed *parsedChat, response map[string]any) {
 	if parsed.sourceKeys == nil {
 		parsed.sourceKeys = make(map[string]struct{})
 	}
-	if search, _ := response["webSearchResults"].(map[string]any); search != nil {
-		if values, ok := search["results"].([]any); ok {
-			for _, raw := range values {
-				item, _ := raw.(map[string]any)
-				value, _ := item["url"].(string)
-				if value == "" {
-					continue
-				}
-				title, _ := item["title"].(string)
-				appendSearchSource(parsed, value, title, "web")
-			}
-		}
+	collectWebSearchResults(parsed, response["webSearchResults"])
+	collectWebSearchResults(parsed, response["citedWebSearchResults"])
+	collectXSearchResults(parsed, response["xSearchResults"])
+	collectXSearchResults(parsed, response["xposts"])
+	collectXSearchResults(parsed, response["citedXposts"])
+}
+
+func collectWebSearchResults(parsed *parsedChat, value any) {
+	if wrapped, _ := value.(map[string]any); wrapped != nil {
+		value = wrapped["results"]
 	}
-	if search, _ := response["xSearchResults"].(map[string]any); search != nil {
-		if values, ok := search["results"].([]any); ok {
-			for _, raw := range values {
-				item, _ := raw.(map[string]any)
-				username, _ := item["username"].(string)
-				postID, _ := item["postId"].(string)
-				if username == "" || postID == "" {
-					continue
-				}
-				title, _ := item["text"].(string)
-				value := "https://x.com/" + url.PathEscape(username) + "/status/" + url.PathEscape(postID)
-				appendSearchSource(parsed, value, title, "x_post")
-			}
+	values, _ := value.([]any)
+	for _, raw := range values {
+		item, _ := raw.(map[string]any)
+		rawURL, _ := item["url"].(string)
+		if rawURL == "" {
+			continue
 		}
+		title, _ := item["title"].(string)
+		appendSearchSource(parsed, rawURL, title, "web")
+	}
+}
+
+func collectXSearchResults(parsed *parsedChat, value any) {
+	if wrapped, _ := value.(map[string]any); wrapped != nil {
+		value = wrapped["results"]
+	}
+	values, _ := value.([]any)
+	for _, raw := range values {
+		item, _ := raw.(map[string]any)
+		username, _ := item["username"].(string)
+		postID, _ := item["postId"].(string)
+		if username == "" || postID == "" {
+			continue
+		}
+		title, _ := item["text"].(string)
+		rawURL := "https://x.com/" + url.PathEscape(username) + "/status/" + url.PathEscape(postID)
+		appendSearchSource(parsed, rawURL, title, "x_post")
 	}
 }
 
 func appendSearchSource(parsed *parsedChat, value, title, sourceType string) {
+	value, valid := searchresult.NormalizeURL(value)
+	if !valid {
+		return
+	}
+	if parsed.sourceKeys == nil {
+		parsed.sourceKeys = make(map[string]struct{})
+	}
 	if _, exists := parsed.sourceKeys[value]; exists {
 		return
 	}
-	parsed.sourceKeys[value] = struct{}{}
-	if strings.TrimSpace(title) == "" {
-		title = value
+	if len(parsed.SearchSources) >= searchresult.MaxResults {
+		return
 	}
+	parsed.sourceKeys[value] = struct{}{}
+	title = searchresult.NormalizeTitle(title, value)
 	parsed.SearchSources = append(parsed.SearchSources, map[string]any{"url": value, "title": title, "type": sourceType})
 }
 
@@ -922,18 +1044,83 @@ func collectServerTool(parsed *parsedChat, response map[string]any) {
 	if parsed.serverToolKeys == nil {
 		parsed.serverToolKeys = make(map[string]struct{})
 	}
-	key := firstString(response, "rolloutId", "responseId", "toolUsageCardId", "messageTag")
-	if step, ok := numberAsInt(response["messageStepId"]); ok {
-		key += fmt.Sprintf(":%d", step)
+	key := serverToolKey(response)
+	if _, exists := parsed.serverToolKeys[key]; !exists {
+		if len(parsed.serverToolKeys) >= maxTrackedServerTools {
+			return
+		}
+		parsed.serverToolKeys[key] = struct{}{}
+		parsed.ServerTools++
 	}
-	if key == "" {
-		key = firstString(response, "token", "messageTag")
-	}
-	if _, exists := parsed.serverToolKeys[key]; exists {
+	if webServerToolName(response) != "web_search" {
 		return
 	}
-	parsed.serverToolKeys[key] = struct{}{}
-	parsed.ServerTools++
+	if parsed.webSearchKeys == nil {
+		parsed.webSearchKeys = make(map[string]struct{})
+	}
+	if _, exists := parsed.webSearchKeys[key]; exists || len(parsed.webSearchKeys) >= maxTrackedServerTools {
+		return
+	}
+	parsed.webSearchKeys[key] = struct{}{}
+	parsed.WebSearchTools++
+}
+
+func serverToolKey(response map[string]any) string {
+	key := firstString(response, "rolloutId", "responseId", "toolUsageCardId")
+	step, hasStep := numberAsInt(response["messageStepId"])
+	if key != "" {
+		if hasStep {
+			key += fmt.Sprintf(":%d", step)
+		}
+		return key
+	}
+	if token, _ := response["token"].(string); token != "" {
+		sum := sha256.Sum256([]byte(token))
+		return "token:" + hex.EncodeToString(sum[:8])
+	}
+	if hasStep {
+		return fmt.Sprintf("step:%d", step)
+	}
+	return firstString(response, "messageTag")
+}
+
+func webServerToolName(response map[string]any) string {
+	if name := strings.ToLower(strings.TrimSpace(firstString(response, "toolName", "tool_name"))); name != "" {
+		return name
+	}
+	if card, _ := response["toolUsageCard"].(map[string]any); card != nil {
+		if name := strings.ToLower(strings.TrimSpace(firstString(card, "toolName", "tool_name", "name"))); name != "" {
+			return name
+		}
+		for _, tool := range []struct {
+			field string
+			name  string
+		}{
+			{field: "webSearch", name: "web_search"},
+			{field: "web_search", name: "web_search"},
+			{field: "xSearch", name: "x_search"},
+			{field: "x_search", name: "x_search"},
+			{field: "browsePage", name: "browse_page"},
+			{field: "browse_page", name: "browse_page"},
+			{field: "searchImages", name: "search_images"},
+			{field: "search_images", name: "search_images"},
+			{field: "chatroomSend", name: "chatroom_send"},
+			{field: "chatroom_send", name: "chatroom_send"},
+		} {
+			if card[tool.field] != nil {
+				return tool.name
+			}
+		}
+	}
+	token, _ := response["token"].(string)
+	match := grokToolNamePattern.FindStringSubmatch(token)
+	if len(match) < 2 {
+		return ""
+	}
+	name := strings.TrimSpace(match[1])
+	name = strings.TrimPrefix(name, "<![CDATA[")
+	name = strings.TrimSuffix(name, "]]>")
+	return strings.ToLower(strings.TrimSpace(name))
 }
 
 func applyParsedToolCalls(parsed *parsedChat, configuration toolConfiguration) {
@@ -1102,7 +1289,8 @@ func renderChatCard(parsed *parsedChat, cardID, renderType string) (string, map[
 		return fmt.Sprintf("![%s](%s)", title, thumbnail), nil
 	case "render_inline_citation":
 		value, _ := card["url"].(string)
-		if value == "" {
+		value, valid := searchresult.NormalizeURL(value)
+		if !valid {
 			return "", nil
 		}
 		if parsed.citationIndex == nil {
@@ -1127,6 +1315,9 @@ func renderChatCard(parsed *parsedChat, cardID, renderType string) (string, map[
 }
 
 func searchSourceTitle(sources []map[string]any, rawURL string) string {
+	if normalized, valid := searchresult.NormalizeURL(rawURL); valid {
+		rawURL = normalized
+	}
 	for _, source := range sources {
 		if value, _ := source["url"].(string); value == rawURL {
 			if title, _ := source["title"].(string); title != "" {
@@ -1170,9 +1361,14 @@ func buildOpenAIResult(operation, responseID, model string, parsed parsedChat, s
 	}
 	if operation == conversation.OperationMessages {
 		visibleText, stopSequence := applyWebStopSequences(parsed.Text.String(), options.StopSequences)
-		content := make([]any, 0, len(parsed.ToolCalls)+2)
+		emitWebSearch := shouldEmitWebMessagesSearch(parsed, options)
+		// Zero initial capacity: tool/search counts come from untrusted upstream.
+		content := make([]any, 0)
 		if options.AnthropicThinking && parsed.Reasoning.Len() > 0 {
 			content = append(content, map[string]any{"type": "thinking", "thinking": parsed.Reasoning.String()})
+		}
+		if emitWebSearch {
+			content = append(content, webMessagesSearchBlocks(newWebID("srvtoolu"), parsed, options)...)
 		}
 		if visibleText != "" || len(parsed.ToolCalls) == 0 {
 			content = append(content, map[string]any{"type": "text", "text": visibleText})
@@ -1190,10 +1386,14 @@ func buildOpenAIResult(operation, responseID, model string, parsed parsedChat, s
 		} else if stopSequence != "" {
 			stopReason = "stop_sequence"
 		}
+		usage := map[string]any{"input_tokens": inputTokens, "output_tokens": outputTokens, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0}
+		if emitWebSearch {
+			usage["server_tool_use"] = map[string]any{"web_search_requests": webMessagesSearchRequests(parsed)}
+		}
 		return map[string]any{
 			"id": strings.Replace(responseID, "resp_", "msg_", 1), "type": "message", "role": "assistant", "model": model,
 			"content": content, "stop_reason": stopReason, "stop_sequence": nullableWebString(stopSequence),
-			"usage": map[string]any{"input_tokens": inputTokens, "output_tokens": outputTokens, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0},
+			"usage": usage,
 		}
 	}
 	output := make([]any, 0, 2)
@@ -1269,6 +1469,49 @@ func webAnthropicToolID(value string) string {
 	return "toolu_" + value
 }
 
+func webMessagesSearchBlocks(id string, parsed parsedChat, options conversation.ResponseOptions) []any {
+	use := map[string]any{
+		"type": "server_tool_use", "id": id, "name": "web_search",
+		"input": map[string]any{"query": options.AnthropicWebSearchQuery},
+	}
+	hits := make([]any, 0, searchresult.MaxResults)
+	seen := make(map[string]struct{}, searchresult.MaxResults)
+	for _, source := range parsed.SearchSources {
+		if len(hits) >= searchresult.MaxResults {
+			break
+		}
+		rawURL, _ := source["url"].(string)
+		rawURL, valid := searchresult.NormalizeURL(rawURL)
+		if !valid {
+			continue
+		}
+		if _, exists := seen[rawURL]; exists {
+			continue
+		}
+		seen[rawURL] = struct{}{}
+		title, _ := source["title"].(string)
+		title = searchresult.NormalizeTitle(title, rawURL)
+		hits = append(hits, map[string]any{"type": "web_search_result", "title": title, "url": rawURL})
+	}
+	var content any = hits
+	if parsed.WebSearchTools == 0 && len(hits) == 0 {
+		content = map[string]any{"type": "web_search_tool_result_error", "error_code": "unavailable"}
+	}
+	result := map[string]any{"type": "web_search_tool_result", "tool_use_id": id, "content": content}
+	return []any{use, result}
+}
+
+func shouldEmitWebMessagesSearch(parsed parsedChat, options conversation.ResponseOptions) bool {
+	return options.AnthropicWebSearch && (options.AnthropicWebSearchRequired || parsed.WebSearchTools > 0 || len(parsed.SearchSources) > 0)
+}
+
+func webMessagesSearchRequests(parsed parsedChat) int64 {
+	if parsed.WebSearchTools > 0 {
+		return parsed.WebSearchTools
+	}
+	return 1
+}
+
 func chatToolCalls(calls []parsedToolCall) []any {
 	values := make([]any, 0, len(calls))
 	for _, call := range calls {
@@ -1317,6 +1560,9 @@ type webMessagesStream struct {
 	textIndex       int
 	nextIndex       int
 	hasTools        bool
+	webSearchID     string
+	webSearchUse    bool
+	pendingText     strings.Builder
 	stopSequence    string
 	stopFilter      *webStopFilter
 }
@@ -1333,13 +1579,19 @@ func (s *webMessagesStream) Start() error {
 		return nil
 	}
 	s.started = true
-	return writeSSE(s.writer, "message_start", map[string]any{
+	if err := writeSSE(s.writer, "message_start", map[string]any{
 		"type": "message_start", "message": map[string]any{
 			"id": strings.Replace(s.responseID, "resp_", "msg_", 1), "type": "message", "role": "assistant", "model": s.model,
 			"content": []any{}, "stop_reason": nil, "stop_sequence": nil,
 			"usage": map[string]any{"input_tokens": s.inputTokens, "output_tokens": 0, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0},
 		},
-	})
+	}); err != nil {
+		return err
+	}
+	if s.options.AnthropicWebSearchRequired && !s.options.AnthropicThinking {
+		return s.startWebSearch()
+	}
+	return nil
 }
 
 func (s *webMessagesStream) Delta(kind, delta string) error {
@@ -1372,6 +1624,17 @@ func (s *webMessagesStream) Delta(kind, delta string) error {
 	if kind != "text" {
 		return nil
 	}
+	if s.options.AnthropicWebSearch {
+		if err := s.closeThinking(); err != nil {
+			return err
+		}
+		if s.options.AnthropicWebSearchRequired {
+			if err := s.startWebSearch(); err != nil {
+				return err
+			}
+		}
+		return s.bufferSearchText(delta)
+	}
 	if err := s.startText(); err != nil {
 		return err
 	}
@@ -1383,6 +1646,15 @@ func (s *webMessagesStream) Delta(kind, delta string) error {
 		return nil
 	}
 	return s.writeTextDelta(emit)
+}
+
+func (s *webMessagesStream) bufferSearchText(delta string) error {
+	pending := s.pendingText.Len()
+	if pending >= maxDeferredSearchTextBytes || len(delta) > maxDeferredSearchTextBytes-pending {
+		return fmt.Errorf("WebSearch 延迟文本缓冲超过 %d MiB", maxDeferredSearchTextBytes>>20)
+	}
+	s.pendingText.WriteString(delta)
+	return nil
 }
 
 func (s *webMessagesStream) startText() error {
@@ -1446,9 +1718,74 @@ func (s *webMessagesStream) Tools(calls []parsedToolCall) error {
 	return nil
 }
 
+func (s *webMessagesStream) startWebSearch() error {
+	if s.webSearchUse {
+		return nil
+	}
+	s.webSearchUse = true
+	if s.webSearchID == "" {
+		s.webSearchID = newWebID("srvtoolu")
+	}
+	index := s.nextIndex
+	s.nextIndex++
+	if err := writeSSE(s.writer, "content_block_start", map[string]any{
+		"type": "content_block_start", "index": index,
+		"content_block": map[string]any{"type": "server_tool_use", "id": s.webSearchID, "name": "web_search", "input": map[string]any{}},
+	}); err != nil {
+		return err
+	}
+	if query := s.options.AnthropicWebSearchQuery; query != "" {
+		encoded, _ := json.Marshal(map[string]string{"query": query})
+		if err := writeSSE(s.writer, "content_block_delta", map[string]any{
+			"type": "content_block_delta", "index": index,
+			"delta": map[string]any{"type": "input_json_delta", "partial_json": string(encoded)},
+		}); err != nil {
+			return err
+		}
+	}
+	return writeSSE(s.writer, "content_block_stop", map[string]any{"type": "content_block_stop", "index": index})
+}
+
+func (s *webMessagesStream) finishWebSearch(parsed parsedChat) error {
+	if !shouldEmitWebMessagesSearch(parsed, s.options) {
+		return nil
+	}
+	if err := s.startWebSearch(); err != nil {
+		return err
+	}
+	blocks := webMessagesSearchBlocks(s.webSearchID, parsed, s.options)
+	result := blocks[1]
+	index := s.nextIndex
+	s.nextIndex++
+	if err := writeSSE(s.writer, "content_block_start", map[string]any{
+		"type": "content_block_start", "index": index, "content_block": result,
+	}); err != nil {
+		return err
+	}
+	return writeSSE(s.writer, "content_block_stop", map[string]any{"type": "content_block_stop", "index": index})
+}
+
 func (s *webMessagesStream) Finish(parsed parsedChat, payload map[string]any) error {
 	if err := s.Start(); err != nil {
 		return err
+	}
+	if err := s.closeThinking(); err != nil {
+		return err
+	}
+	if err := s.finishWebSearch(parsed); err != nil {
+		return err
+	}
+	if s.options.AnthropicWebSearch && s.pendingText.Len() > 0 {
+		if err := s.startText(); err != nil {
+			return err
+		}
+		emit, matched := s.stopFilter.Push(s.pendingText.String())
+		if matched != "" {
+			s.stopSequence = matched
+		}
+		if err := s.writeTextDelta(emit); err != nil {
+			return err
+		}
 	}
 	if s.stopSequence == "" {
 		if pending := s.stopFilter.Flush(); pending != "" {
@@ -1460,9 +1797,6 @@ func (s *webMessagesStream) Finish(parsed parsedChat, payload map[string]any) er
 			}
 		}
 	}
-	if err := s.closeThinking(); err != nil {
-		return err
-	}
 	if err := s.closeText(); err != nil {
 		return err
 	}
@@ -1473,9 +1807,13 @@ func (s *webMessagesStream) Finish(parsed parsedChat, payload map[string]any) er
 		stopReason = "stop_sequence"
 	}
 	usage, _ := payload["usage"].(map[string]any)
+	finalUsage := map[string]any{"output_tokens": usage["output_tokens"]}
+	if shouldEmitWebMessagesSearch(parsed, s.options) {
+		finalUsage["server_tool_use"] = map[string]any{"web_search_requests": webMessagesSearchRequests(parsed)}
+	}
 	if err := writeSSE(s.writer, "message_delta", map[string]any{
 		"type": "message_delta", "delta": map[string]any{"stop_reason": stopReason, "stop_sequence": nullableWebString(s.stopSequence)},
-		"usage": map[string]any{"output_tokens": usage["output_tokens"]},
+		"usage": finalUsage,
 	}); err != nil {
 		return err
 	}
@@ -1593,6 +1931,26 @@ func writeStreamStart(writer io.Writer, operation, responseID, model string, inp
 		return
 	}
 	writeSSE(writer, "response.created", map[string]any{"type": "response.created", "response": map[string]any{"id": responseID, "object": "response", "status": "in_progress", "model": model, "output": []any{}}})
+}
+
+type webVisibleStreamPhase struct {
+	textStarted bool
+}
+
+// Allow keeps client-visible output monotonic when Grok Web emits additional
+// reasoning after final text has already started. The complete reasoning is
+// still retained in parsedChat for non-streaming output and usage accounting.
+func (p *webVisibleStreamPhase) Allow(kind, delta string) bool {
+	if delta == "" {
+		return false
+	}
+	if kind == "reasoning" {
+		return !p.textStarted
+	}
+	if kind == "text" {
+		p.textStarted = true
+	}
+	return true
 }
 
 func writeStreamDelta(writer io.Writer, operation, responseID, model, kind, delta string) error {

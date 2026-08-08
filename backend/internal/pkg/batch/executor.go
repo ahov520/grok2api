@@ -2,6 +2,7 @@ package batch
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math/rand/v2"
 	"runtime/debug"
@@ -30,6 +31,7 @@ type Pool struct {
 	shared  LeaseLimiter
 	key     string
 	active  atomic.Int64
+	queued  atomic.Int64
 	peak    atomic.Int64
 	jitter  atomic.Int64
 }
@@ -41,6 +43,7 @@ type LeaseLimiter interface {
 type PoolSnapshot struct {
 	Limit  int
 	Active int
+	Queued int
 	Peak   int
 }
 
@@ -109,6 +112,13 @@ func (p *Pool) Do(ctx context.Context, work func(context.Context) error) (err er
 	if err := p.waitJitter(ctx); err != nil {
 		return err
 	}
+	p.queued.Add(1)
+	started := false
+	defer func() {
+		if !started {
+			p.queued.Add(-1)
+		}
+	}()
 	if err := p.acquireSlot(ctx); err != nil {
 		return err
 	}
@@ -133,17 +143,22 @@ func (p *Pool) Do(ctx context.Context, work func(context.Context) error) (err er
 			}
 		}
 	}
-	p.begin()
-	defer p.end()
 	defer func() {
 		if releaseShared != nil {
 			releaseShared()
 		}
 	}()
-	if p.parent != nil {
-		return p.parent.Do(ctx, work)
+	run := func(workCtx context.Context) error {
+		started = true
+		p.queued.Add(-1)
+		p.begin()
+		defer p.end()
+		return invoke(workCtx, work)
 	}
-	return invoke(ctx, work)
+	if p.parent != nil {
+		return p.parent.Do(ctx, run)
+	}
+	return run(ctx)
 }
 
 func (p *Pool) waitJitter(ctx context.Context) error {
@@ -223,7 +238,7 @@ func (p *Pool) Snapshot() PoolSnapshot {
 	if p == nil {
 		return PoolSnapshot{}
 	}
-	return PoolSnapshot{Limit: p.Limit(), Active: int(p.active.Load()), Peak: int(p.peak.Load())}
+	return PoolSnapshot{Limit: p.Limit(), Active: int(p.active.Load()), Queued: int(p.queued.Load()), Peak: int(p.peak.Load())}
 }
 
 // Do 隔离单个任务 panic，适用于长驻 Worker 和后台任务监督器。
@@ -266,8 +281,22 @@ func Map[T, R any](ctx context.Context, items []T, options Options, work func(co
 
 // MapObserved 在任务释放共享容量后通知结果观察者，适合连接下游有界流水线。
 func MapObserved[T, R any](ctx context.Context, items []T, options Options, work func(context.Context, T) (R, error), observe func(index int, result Result[R])) ([]Result[R], Summary, error) {
+	return mapObserved(ctx, items, options, work, observe, true)
+}
+
+// ForEachObserved 执行带观察者的批量任务，但不在内存中保留全部结果。
+// 适用于单项结果已经流式发送给下游、最终只需要汇总信息的批量接口。
+func ForEachObserved[T, R any](ctx context.Context, items []T, options Options, work func(context.Context, T) (R, error), observe func(index int, result Result[R])) (Summary, error) {
+	_, summary, err := mapObserved(ctx, items, options, work, observe, false)
+	return summary, err
+}
+
+func mapObserved[T, R any](ctx context.Context, items []T, options Options, work func(context.Context, T) (R, error), observe func(index int, result Result[R]), collectResults bool) ([]Result[R], Summary, error) {
 	startedAt := time.Now()
-	results := make([]Result[R], len(items))
+	var results []Result[R]
+	if collectResults {
+		results = make([]Result[R], len(items))
+	}
 	summary := Summary{Total: len(items)}
 	if len(items) == 0 {
 		summary.Duration = time.Since(startedAt)
@@ -284,6 +313,10 @@ func MapObserved[T, R any](ctx context.Context, items []T, options Options, work
 	}
 	queueSize = min(queueSize, len(items))
 	jobs := make(chan indexedItem[T], queueSize)
+	var completed atomic.Int64
+	var succeeded atomic.Int64
+	var failed atomic.Int64
+	var panicked atomic.Int64
 	var wait sync.WaitGroup
 	wait.Add(workers)
 	for range workers {
@@ -313,7 +346,19 @@ func MapObserved[T, R any](ctx context.Context, items []T, options Options, work
 							execution.Err = observeErr
 						}
 					}
-					results[job.index] = execution
+					if collectResults {
+						results[job.index] = execution
+					}
+					completed.Add(1)
+					if execution.Err == nil {
+						succeeded.Add(1)
+					} else {
+						failed.Add(1)
+						var panicErr *PanicError
+						if errors.As(execution.Err, &panicErr) {
+							panicked.Add(1)
+						}
+					}
 				}
 			}
 		}()
@@ -333,20 +378,10 @@ sendLoop:
 	}
 	close(jobs)
 	wait.Wait()
-	for _, result := range results {
-		if !result.Completed {
-			continue
-		}
-		summary.Completed++
-		if result.Err == nil {
-			summary.Succeeded++
-			continue
-		}
-		summary.Failed++
-		if _, ok := result.Err.(*PanicError); ok {
-			summary.Panicked++
-		}
-	}
+	summary.Completed = int(completed.Load())
+	summary.Succeeded = int(succeeded.Load())
+	summary.Failed = int(failed.Load())
+	summary.Panicked = int(panicked.Load())
 	summary.Canceled = ctx.Err() != nil
 	summary.Duration = time.Since(startedAt)
 	return results, summary, ctx.Err()

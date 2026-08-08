@@ -6,11 +6,13 @@ const AccountsPage = lazyNamed(() => import("@/features/accounts/accounts-page")
 const AppShell = lazyNamed(() => import("@/app/app-shell"), "AppShell");
 const RequestAuditsPage = lazyNamed(() => import("@/features/audits/request-audits-page"), "RequestAuditsPage");
 const ClientKeysPage = lazyNamed(() => import("@/features/client-keys/client-keys-page"), "ClientKeysPage");
+const CreativeConsolePage = lazyNamed(() => import("@/features/creative-console/creative-console-page"), "CreativeConsolePage");
 const DashboardPage = lazyNamed(() => import("@/features/dashboard/dashboard-page"), "DashboardPage");
 const ApiDocsPage = lazyNamed(() => import("@/features/docs/api-docs-page"), "ApiDocsPage");
 const GalleryPage = lazyNamed(() => import("@/features/media/gallery-page"), "GalleryPage");
 const VideoGalleryPage = lazyNamed(() => import("@/features/media/video-gallery-page"), "VideoGalleryPage");
 const ModelsPage = lazyNamed(() => import("@/features/models/models-page"), "ModelsPage");
+const QualityGuardPage = lazyNamed(() => import("@/features/quality-guard/quality-guard-page"), "QualityGuardPage");
 const SettingsPage = lazyNamed(() => import("@/features/settings/settings-page"), "SettingsPage");
 
 function lazyNamed<T extends Record<K, ComponentType>, K extends keyof T>(loader: () => Promise<T>, exportName: K): LazyExoticComponent<T[K]> {
@@ -37,8 +39,16 @@ export function DeferredModelsPage() {
   return <DeferredPage page={ModelsPage} />;
 }
 
+export function DeferredQualityGuardPage() {
+  return <DeferredPage page={QualityGuardPage} />;
+}
+
 export function DeferredClientKeysPage() {
   return <DeferredPage page={ClientKeysPage} />;
+}
+
+export function DeferredCreativeConsolePage() {
+  return <DeferredPage page={CreativeConsolePage} />;
 }
 
 export function DeferredRequestAuditsPage() {

@@ -4,11 +4,111 @@ import (
 	"encoding/base64"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	clientkeydomain "github.com/chenyme/grok2api/backend/internal/domain/clientkey"
 )
+
+func TestLoadDatabaseURLOverridesYAMLAndSelectsPostgres(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(`secrets:
+  jwtSecret: "12345678901234567890123456789012"
+  credentialEncryptionKey: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+bootstrapAdmin:
+  password: "password123"
+database:
+  driver: sqlite
+  sqlite:
+    path: "./yaml.db"
+  postgres:
+    dsn: "postgres://yaml:yaml@yaml.invalid/yaml"
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	const environmentDSN = "postgresql://env:secret@postgres.internal:5432/grok2api?sslmode=require"
+	t.Setenv(DatabaseURLEnv, environmentDSN)
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Database.Driver != "postgres" || cfg.Database.Postgres.DSN != environmentDSN {
+		t.Fatalf("database config = %#v", cfg.Database)
+	}
+}
+
+func TestLoadEmptyDatabaseURLKeepsYAML(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	const yamlDSN = "postgres://yaml:secret@postgres.internal:5432/grok2api"
+	if err := os.WriteFile(path, []byte(`secrets:
+  jwtSecret: "12345678901234567890123456789012"
+  credentialEncryptionKey: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+bootstrapAdmin:
+  password: "password123"
+database:
+  driver: postgres
+  postgres:
+    dsn: "`+yamlDSN+`"
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(DatabaseURLEnv, "   ")
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Database.Driver != "postgres" || cfg.Database.Postgres.DSN != yamlDSN {
+		t.Fatalf("database config = %#v", cfg.Database)
+	}
+}
+
+func TestLoadDoesNotImplicitlyReadGenericDatabaseURL(t *testing.T) {
+	t.Setenv(DatabaseURLEnv, "")
+	t.Setenv("DATABASE_URL", "postgres://generic:secret@postgres.internal/grok2api")
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(`secrets:
+  jwtSecret: "12345678901234567890123456789012"
+  credentialEncryptionKey: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+bootstrapAdmin:
+  password: "password123"
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Database.Driver != "sqlite" {
+		t.Fatalf("generic DATABASE_URL unexpectedly selected %q", cfg.Database.Driver)
+	}
+}
+
+func TestLoadRejectsInvalidDatabaseEnvironmentURLWithoutLeakingCredentials(t *testing.T) {
+	tests := []struct {
+		name    string
+		value   string
+		message string
+	}{
+		{name: "asyncpg", value: "postgresql+asyncpg://user:highly-secret@postgres.internal/grok2api", message: "改为 postgresql://"},
+		{name: "unsupported scheme", value: "mysql://user:highly-secret@mysql.internal/grok2api", message: "postgres:// 或 postgresql://"},
+		{name: "malformed URL", value: "postgres://user:highly-secret%zz@postgres.internal/grok2api", message: "不是有效的 PostgreSQL URL"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Setenv(DatabaseURLEnv, test.value)
+			_, err := Load("")
+			if err == nil || !strings.Contains(err.Error(), test.message) {
+				t.Fatalf("Load error = %v, want message containing %q", err, test.message)
+			}
+			if strings.Contains(err.Error(), "highly-secret") || strings.Contains(err.Error(), test.value) {
+				t.Fatalf("Load error leaked database credentials: %v", err)
+			}
+		})
+	}
+}
 
 func TestLoadDurationAndSecretsFromYAML(t *testing.T) {
 	dir := t.TempDir()
@@ -48,6 +148,33 @@ bootstrapAdmin:
 	if cfg.Batch.ImportConcurrency != 25 || cfg.Batch.ConversionConcurrency != 25 || cfg.Batch.SyncConcurrency != 25 || cfg.Batch.RefreshConcurrency != 25 || cfg.Batch.RandomDelay.Value() != 500*time.Millisecond {
 		t.Fatalf("batch defaults = %#v", cfg.Batch)
 	}
+	if cfg.Routing.PreferFreeBuild {
+		t.Fatal("preferFreeBuild should retain its false default when omitted from YAML")
+	}
+	if cfg.Routing.SegmentedSelectorEnabled || cfg.Routing.SegmentedMinCandidates != 3000 || cfg.Routing.SegmentedWindowSize != 64 {
+		t.Fatalf("segmented selector defaults = %#v", cfg.Routing)
+	}
+	if cfg.Accounts.AutoCleanReauthEnabled || cfg.Accounts.AutoCleanIncludeDisabled {
+		t.Fatal("accounts auto-clean flags should default to false")
+	}
+	if cfg.Accounts.MarkBuildForbiddenReauth || len(cfg.Accounts.BuildForbiddenReauthCodes) != 1 || cfg.Accounts.BuildForbiddenReauthCodes[0] != "permission-denied" {
+		t.Fatalf("Build forbidden-account defaults = %#v", cfg.Accounts)
+	}
+	if cfg.Accounts.AutoCleanReauthInterval.Value() != 10*time.Minute || cfg.Accounts.AutoCleanReauthMinAge.Value() != time.Hour {
+		t.Fatalf("accounts auto-clean defaults = %#v", cfg.Accounts)
+	}
+	if !cfg.Routing.ReasoningReplayEnabled || cfg.Routing.ReasoningReplayTTL.Value() != time.Hour || cfg.Routing.ReasoningReplayMaxEntries != 10240 {
+		t.Fatalf("reasoning replay defaults = %#v", cfg.Routing)
+	}
+	if cfg.Audit.CommitDelay.Value() != 5*time.Millisecond {
+		t.Fatalf("audit commit delay = %s", cfg.Audit.CommitDelay.Value())
+	}
+	if cfg.Audit.LedgerMode != "enforce" || cfg.Audit.LedgerFailureThreshold != 1 {
+		t.Fatalf("audit ledger defaults = %#v", cfg.Audit)
+	}
+	if cfg.Provider.Build.ResponseHeaderTimeout.Value() != 5*time.Minute {
+		t.Fatalf("Build response header timeout = %s", cfg.Provider.Build.ResponseHeaderTimeout.Value())
+	}
 	expectedDatabasePath := filepath.Join(dir, "data", "backend.db")
 	if cfg.Database.SQLite.Path != expectedDatabasePath {
 		t.Fatalf("database path = %q, want %q", cfg.Database.SQLite.Path, expectedDatabasePath)
@@ -62,15 +189,63 @@ bootstrapAdmin:
 	}
 }
 
+func TestLoadQualityGuardFromYAML(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	data := []byte(`secrets:
+  jwtSecret: "12345678901234567890123456789012"
+  credentialEncryptionKey: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+bootstrapAdmin:
+  password: "password123"
+qualityGuard:
+  enabled: true
+  clientKeyID: 999
+  model: "grok-4.5"
+  nodeIDs: [2, 9]
+  minimumHealthyNodes: 1
+  activeInterval: 45m
+`)
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	value, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !value.QualityGuard.Enabled || value.QualityGuard.DeprecatedClientKeyID != 999 || value.QualityGuard.ActiveInterval.Value() != 45*time.Minute {
+		t.Fatalf("qualityGuard = %#v", value.QualityGuard)
+	}
+}
+
+func TestEnabledQualityGuardUsesManagedIdentity(t *testing.T) {
+	value := defaultConfig()
+	value.Secrets.JWTSecret = "12345678901234567890123456789012"
+	value.Secrets.CredentialEncryptionKey = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+	value.BootstrapAdmin.Password = "password123"
+	value.QualityGuard.Enabled = true
+	if err := value.Validate(); err != nil {
+		t.Fatalf("enabled quality guard should not require a client key ID: %v", err)
+	}
+}
+
+func TestBuildResponseHeaderTimeoutIsRuntimeOnly(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte("provider:\n  build:\n    responseHeaderTimeout: 10m\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(path); err == nil {
+		t.Fatal("runtime-only Build response header timeout was accepted from YAML")
+	}
+}
+
 func TestDefaultGrokBuildClientVersionMatchesLocalBaseline(t *testing.T) {
 	build := defaultConfig().Provider.Build
-	if RecommendedBuildClientVersion != "0.2.99" {
+	if RecommendedBuildClientVersion != "0.2.119" {
 		t.Fatalf("recommended clientVersion = %q", RecommendedBuildClientVersion)
 	}
 	if build.ClientVersion != RecommendedBuildClientVersion {
 		t.Fatalf("clientVersion = %q", build.ClientVersion)
 	}
-	if RecommendedBuildUserAgent != "grok-shell/0.2.99 (linux; x86_64)" {
+	if RecommendedBuildUserAgent != "grok-shell/0.2.119 (linux; x86_64)" {
 		t.Fatalf("recommended userAgent = %q", RecommendedBuildUserAgent)
 	}
 	if build.UserAgent != RecommendedBuildUserAgent {
@@ -78,10 +253,53 @@ func TestDefaultGrokBuildClientVersionMatchesLocalBaseline(t *testing.T) {
 	}
 }
 
+func TestLoadKeepsExplicitGrokBuildClientFingerprint(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	data := []byte(`provider:
+  build:
+    clientVersion: "0.2.111"
+    userAgent: "grok-shell/0.2.111 (linux; x86_64)"
+secrets:
+  jwtSecret: "12345678901234567890123456789012"
+  credentialEncryptionKey: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+`)
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Provider.Build.ClientVersion != "0.2.111" || cfg.Provider.Build.UserAgent != "grok-shell/0.2.111 (linux; x86_64)" {
+		t.Fatalf("explicit Build fingerprint was overwritten: %#v", cfg.Provider.Build)
+	}
+}
+
 func TestDefaultConsoleProviderConfig(t *testing.T) {
 	console := defaultConfig().Provider.Console
-	if console.BaseURL != "https://console.x.ai" || console.UserAgent == "" || console.ChatTimeout.Value() != 5*time.Minute {
+	if console.BaseURL != "https://console.x.ai" || console.LegacyUserAgent != "" || console.ChatTimeout.Value() != 5*time.Minute {
 		t.Fatalf("console defaults = %#v", console)
+	}
+}
+
+func TestLoadAcceptsLegacyConsoleUserAgent(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	data := []byte(`provider:
+  console:
+    userAgent: "legacy-console-agent"
+secrets:
+  jwtSecret: "12345678901234567890123456789012"
+  credentialEncryptionKey: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+`)
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Provider.Console.LegacyUserAgent != "legacy-console-agent" {
+		t.Fatalf("legacy userAgent = %q", cfg.Provider.Console.LegacyUserAgent)
 	}
 }
 
@@ -92,12 +310,13 @@ func TestLoadAcceptsRuntimeDefaultsAndRejectsUnknownFields(t *testing.T) {
   credentialEncryptionKey: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
 routing:
   maxAttempts: 9
+  preferFreeBuild: true
 `)
 	if err := os.WriteFile(path, data, 0o600); err != nil {
 		t.Fatal(err)
 	}
 	cfg, err := Load(path)
-	if err != nil || cfg.Routing.MaxAttempts != 9 {
+	if err != nil || cfg.Routing.MaxAttempts != 9 || !cfg.Routing.PreferFreeBuild {
 		t.Fatalf("runtime defaults = %#v, err = %v", cfg.Routing, err)
 	}
 	data = append(data, []byte("unknownField: true\n")...)
@@ -106,6 +325,66 @@ routing:
 	}
 	if _, err := Load(path); err == nil {
 		t.Fatal("unknown field was accepted")
+	}
+}
+
+func TestRoutingMaxAttemptsSupportsLargeCredentialPools(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.Secrets.JWTSecret = "12345678901234567890123456789012"
+	cfg.Secrets.CredentialEncryptionKey = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+	if cfg.Routing.MaxAttempts != 999 {
+		t.Fatalf("default max attempts = %d, want 999", cfg.Routing.MaxAttempts)
+	}
+	if cfg.Routing.CapacityWait.Value() != 500*time.Millisecond {
+		t.Fatalf("default capacity wait = %s, want 500ms", cfg.Routing.CapacityWait.Value())
+	}
+	if cfg.Provider.Web.ChatTimeout.Value() != 2*time.Minute {
+		t.Fatalf("default web chat timeout = %s, want 2m", cfg.Provider.Web.ChatTimeout.Value())
+	}
+	cfg.Routing.MaxAttempts = 65535
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("65535 attempts should be valid: %v", err)
+	}
+	cfg.Routing.MaxAttempts = 65536
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("65536 attempts should be rejected")
+	}
+	cfg.Routing.MaxAttempts = 999
+	cfg.Routing.CapacityWait = Duration(30 * time.Second)
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("30s capacity wait should be valid: %v", err)
+	}
+	cfg.Routing.CapacityWait = Duration(31 * time.Second)
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("31s capacity wait should be rejected")
+	}
+	cfg.Routing.CapacityWait = Duration(500 * time.Millisecond)
+	cfg.Routing.MaxAttempts = -1
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("unlimited attempts should be valid: %v", err)
+	}
+	cfg.Routing.MaxAttempts = 0
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("zero attempts should be rejected")
+	}
+	cfg.Routing.MaxAttempts = -2
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("values below unlimited sentinel should be rejected")
+	}
+}
+
+func TestValidateRejectsInvalidSegmentedSelectorConfig(t *testing.T) {
+	tests := []func(*RoutingConfig){
+		func(value *RoutingConfig) { value.SegmentedMinCandidates = 99 },
+		func(value *RoutingConfig) { value.SegmentedWindowSize = 257 },
+		func(value *RoutingConfig) { value.SegmentedWindowSize = value.SegmentedMinCandidates + 1 },
+	}
+	for index, mutate := range tests {
+		cfg := defaultConfig()
+		mutate(&cfg.Routing)
+		if err := cfg.Validate(); err == nil {
+			t.Fatalf("case %d accepted invalid segmented selector config", index)
+		}
 	}
 }
 
@@ -147,13 +426,15 @@ func TestValidateRejectsUnsafeRuntimeLimits(t *testing.T) {
 	tests := map[string]func(*Config){
 		"request body": func(cfg *Config) { cfg.Server.MaxBodyBytes = maxServerBodyBytes + 1 },
 		"audit buffer": func(cfg *Config) { cfg.Audit.BufferSize = maxAuditBufferSize + 1 },
+		"audit commit delay": func(cfg *Config) {
+			cfg.Audit.CommitDelay = Duration(maxAuditCommitDelay + time.Millisecond)
+		},
 		"client rpm":   func(cfg *Config) { cfg.ClientKeyDefaults.RPMLimit = clientkeydomain.MaxRPMLimit + 1 },
 		"image size":   func(cfg *Config) { cfg.Media.MaxImageBytes = 33 << 20 },
 		"media total":  func(cfg *Config) { cfg.Media.MaxTotalBytes = 1 },
 		"batch limit":  func(cfg *Config) { cfg.Batch.SyncConcurrency = 51 },
 		"batch jitter": func(cfg *Config) { cfg.Batch.RandomDelay = Duration(6 * time.Second) },
 		"console url":  func(cfg *Config) { cfg.Provider.Console.BaseURL = "http://console.x.ai" },
-		"console ua":   func(cfg *Config) { cfg.Provider.Console.UserAgent = "" },
 		"console timeout": func(cfg *Config) {
 			cfg.Provider.Console.ChatTimeout = Duration(time.Second)
 		},
@@ -171,7 +452,7 @@ func TestValidateRejectsUnsafeRuntimeLimits(t *testing.T) {
 	}
 }
 
-func TestValidateRejectsExampleSecretsAndUnsafeCookies(t *testing.T) {
+func TestValidateRejectsExampleSecrets(t *testing.T) {
 	base := defaultConfig()
 	base.Secrets.JWTSecret = "12345678901234567890123456789012"
 	base.Secrets.CredentialEncryptionKey = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
@@ -180,10 +461,6 @@ func TestValidateRejectsExampleSecretsAndUnsafeCookies(t *testing.T) {
 		"example jwt":            func(cfg *Config) { cfg.Secrets.JWTSecret = "replace-with-at-least-32-characters" },
 		"invalid encryption key": func(cfg *Config) { cfg.Secrets.CredentialEncryptionKey = "not-a-32-byte-base64-key" },
 		"example admin password": func(cfg *Config) { cfg.BootstrapAdmin.Password = "replace-with-a-strong-password" },
-		"https insecure cookie": func(cfg *Config) {
-			cfg.Frontend.PublicAPIBaseURL = "https://api.example.com"
-			cfg.Auth.SecureCookies = false
-		},
 	}
 	for name, mutate := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -193,13 +470,6 @@ func TestValidateRejectsExampleSecretsAndUnsafeCookies(t *testing.T) {
 				t.Fatal("unsafe configuration was accepted")
 			}
 		})
-	}
-
-	secure := base
-	secure.Frontend.PublicAPIBaseURL = "https://api.example.com"
-	secure.Auth.SecureCookies = true
-	if err := secure.Validate(); err != nil {
-		t.Fatalf("secure HTTPS configuration rejected: %v", err)
 	}
 }
 
@@ -231,6 +501,29 @@ func TestValidateStatsigModes(t *testing.T) {
 	}
 }
 
+func TestValidateFlareSolverrClearance(t *testing.T) {
+	base := defaultConfig()
+	base.Secrets.JWTSecret = "12345678901234567890123456789012"
+	base.Secrets.CredentialEncryptionKey = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+	base.Provider.Web.ClearanceMode = ClearanceModeFlareSolverr
+	base.Provider.Web.FlareSolverrURL = "http://flaresolverr:8191"
+	if err := base.Validate(); err != nil {
+		t.Fatalf("valid FlareSolverr config rejected: %v", err)
+	}
+	base.Provider.Web.FlareSolverrURL = "ftp://solver.example"
+	if err := base.Validate(); err == nil {
+		t.Fatal("invalid FlareSolverr scheme was accepted")
+	}
+	base.Provider.Web.FlareSolverrURL = "http://solver.example:8191"
+	if err := base.Validate(); err == nil {
+		t.Fatal("public plaintext FlareSolverr URL was accepted")
+	}
+	base.Provider.Web.FlareSolverrURL = "https://solver.example/v1"
+	if err := base.Validate(); err != nil {
+		t.Fatalf("public HTTPS FlareSolverr URL rejected: %v", err)
+	}
+}
+
 func TestValidateInfrastructureDrivers(t *testing.T) {
 	base := defaultConfig()
 	base.Secrets.JWTSecret = "12345678901234567890123456789012"
@@ -242,6 +535,16 @@ func TestValidateInfrastructureDrivers(t *testing.T) {
 	postgresRedis.RuntimeStore.Driver = "redis"
 	if err := postgresRedis.Validate(); err != nil {
 		t.Fatalf("valid postgres + redis configuration rejected: %v", err)
+	}
+	postgresRedis.Deployment = DeploymentConfig{Replicas: 2, InstanceID: "replica-a", ClusterID: "cluster-a", SharedMedia: true}
+	if err := postgresRedis.Validate(); err != nil {
+		t.Fatalf("valid multi-replica configuration rejected: %v", err)
+	}
+
+	invalidMultiReplica := base
+	invalidMultiReplica.Deployment.Replicas = 2
+	if err := invalidMultiReplica.Validate(); err == nil {
+		t.Fatal("multi-replica SQLite and memory configuration was accepted")
 	}
 
 	invalidDatabase := base
@@ -261,15 +564,34 @@ func TestValidateFrontendPublicAPIBaseURL(t *testing.T) {
 	cfg := defaultConfig()
 	cfg.Secrets.JWTSecret = "12345678901234567890123456789012"
 	cfg.Secrets.CredentialEncryptionKey = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
-	for _, value := range []string{"", "127.0.0.1:8000", "ftp://example.com", "https://user@example.com", "https://example.com?token=value"} {
+	for _, value := range []string{"127.0.0.1:8000", "ftp://example.com", "https://user@example.com", "https://example.com?token=value"} {
 		cfg.Frontend.PublicAPIBaseURL = value
 		if err := cfg.Validate(); err == nil {
 			t.Fatalf("frontend.publicApiBaseURL %q was accepted", value)
 		}
 	}
 	cfg.Frontend.PublicAPIBaseURL = "https://api.example.com/grok2api"
-	cfg.Auth.SecureCookies = true
+	cfg.Auth.SecureCookies = false
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("valid frontend.publicApiBaseURL rejected: %v", err)
+	}
+}
+
+func TestEffectivePublicAPIBaseURLPriority(t *testing.T) {
+	cases := []struct {
+		name     string
+		frontend FrontendConfig
+		want     string
+	}{
+		{name: "runtime override", frontend: FrontendConfig{PublicAPIBaseURL: "https://yaml.example/base", PublicAPIBaseURLOverride: "https://runtime.example/api/"}, want: "https://runtime.example/api"},
+		{name: "yaml fallback", frontend: FrontendConfig{PublicAPIBaseURL: "https://yaml.example/base/"}, want: "https://yaml.example/base"},
+		{name: "local fallback", frontend: FrontendConfig{}, want: DefaultPublicAPIBaseURL},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.frontend.EffectivePublicAPIBaseURL(); got != tc.want {
+				t.Fatalf("EffectivePublicAPIBaseURL() = %q, want %q", got, tc.want)
+			}
+		})
 	}
 }

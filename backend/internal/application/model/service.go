@@ -10,6 +10,7 @@ import (
 
 	accountapp "github.com/chenyme/grok2api/backend/internal/application/account"
 	"github.com/chenyme/grok2api/backend/internal/domain/account"
+	clientkeydomain "github.com/chenyme/grok2api/backend/internal/domain/clientkey"
 	modeldomain "github.com/chenyme/grok2api/backend/internal/domain/model"
 	"github.com/chenyme/grok2api/backend/internal/infra/provider"
 	"github.com/chenyme/grok2api/backend/internal/pkg/batch"
@@ -19,6 +20,8 @@ import (
 
 const defaultModelSyncWorkers = 25
 const syncFailurePersistTimeout = 5 * time.Second
+
+var maxModelBatchSize = repository.MaxPageSize * len(modeldomain.Capabilities())
 
 var (
 	ErrInvalidFilter = errors.New("模型筛选条件无效")
@@ -47,10 +50,18 @@ type AccountOption struct {
 	Name string
 }
 
+type RouteGroup struct {
+	Routes               []modeldomain.Route
+	EndpointCapabilities []string
+}
+
 type ListFilter struct {
-	Provider string
-	Status   string
-	Sort     repository.SortQuery
+	Provider    string
+	Providers   []string
+	Tiers       []string
+	Status      string
+	ActiveScope bool
+	Sort        repository.SortQuery
 }
 
 // Service 负责上游模型发现、内部来源路由与对外模型名称维护。
@@ -82,6 +93,19 @@ func (s *Service) SetLogger(logger *slog.Logger) {
 
 func (s *Service) List(ctx context.Context, page, pageSize int, search string, filter ListFilter) ([]modeldomain.Route, int64, error) {
 	page, pageSize = normalizePage(page, pageSize)
+	if !validProviderFilter(filter.Provider) || !validProviderFilters(filter.Providers) || !validTierFilters(filter.Tiers) || !validModelFilter(filter.Status, "", "enabled", "disabled") || !repository.IsValidSort(filter.Sort, "publicId", "upstreamModel", "status", "provider", "accountSupport", "lastSyncedAt") {
+		return nil, 0, ErrInvalidFilter
+	}
+	var enabled *bool
+	if filter.Status != "" {
+		value := filter.Status == "enabled"
+		enabled = &value
+	}
+	return s.models.List(ctx, repository.ModelListQuery{Page: repository.PageQuery{Offset: (page - 1) * pageSize, Limit: pageSize, Search: search, Sort: filter.Sort}, Filter: repository.ModelListFilter{Provider: filter.Provider, Providers: filter.Providers, Tiers: filter.Tiers, Enabled: enabled, ActiveScope: filter.ActiveScope}})
+}
+
+func (s *Service) ListGroups(ctx context.Context, page, pageSize int, search string, filter ListFilter) ([]RouteGroup, int64, error) {
+	page, pageSize = normalizePage(page, pageSize)
 	if !validProviderFilter(filter.Provider) || !validModelFilter(filter.Status, "", "enabled", "disabled") || !repository.IsValidSort(filter.Sort, "publicId", "upstreamModel", "status", "provider", "accountSupport", "lastSyncedAt") {
 		return nil, 0, ErrInvalidFilter
 	}
@@ -90,11 +114,87 @@ func (s *Service) List(ctx context.Context, page, pageSize int, search string, f
 		value := filter.Status == "enabled"
 		enabled = &value
 	}
-	return s.models.List(ctx, repository.ModelListQuery{Page: repository.PageQuery{Offset: (page - 1) * pageSize, Limit: pageSize, Search: search, Sort: filter.Sort}, Filter: repository.ModelListFilter{Provider: filter.Provider, Enabled: enabled}})
+	values, total, err := s.models.ListGroups(ctx, repository.ModelListQuery{
+		Page:   repository.PageQuery{Offset: (page - 1) * pageSize, Limit: pageSize, Search: search, Sort: filter.Sort},
+		Filter: repository.ModelListFilter{Provider: filter.Provider, Enabled: enabled},
+	})
+	if err != nil {
+		return nil, 0, err
+	}
+	groups := make([]RouteGroup, 0, len(values))
+	for _, value := range values {
+		groups = append(groups, RouteGroup{Routes: value.Routes, EndpointCapabilities: s.endpointCapabilities(value.Routes)})
+	}
+	return groups, total, nil
+}
+
+func (s *Service) endpointCapabilities(routes []modeldomain.Route) []string {
+	if len(routes) == 0 || s.providers == nil {
+		return nil
+	}
+	definition, ok := s.providers.Definition(routes[0].Provider)
+	if !ok {
+		return nil
+	}
+	return endpointCapabilitiesForDefinition(routes, definition)
+}
+
+func endpointCapabilitiesForDefinition(routes []modeldomain.Route, definition provider.Definition) []string {
+	available := make(map[string]bool, 6)
+	for _, route := range routes {
+		switch route.Capability {
+		case modeldomain.CapabilityResponses, modeldomain.CapabilityChat:
+			available["completions"] = definition.Conversation.ChatCompletions
+			available["responses"] = definition.Conversation.Responses
+			available["messages"] = definition.Conversation.Messages
+		case modeldomain.CapabilityImage:
+			available["image"] = definition.Media.ImageGeneration
+		case modeldomain.CapabilityImageEdit:
+			available["image_edit"] = definition.Media.ImageEdit
+		case modeldomain.CapabilityVideo:
+			available["video"] = definition.Media.VideoGeneration
+		}
+	}
+	order := []string{"completions", "responses", "messages", "image", "image_edit", "video"}
+	result := make([]string, 0, len(order))
+	for _, capability := range order {
+		if available[capability] {
+			result = append(result, capability)
+		}
+	}
+	return result
 }
 
 func validProviderFilter(value string) bool {
 	return value == "" || account.Provider(value).IsValid()
+}
+
+func validProviderFilters(values []string) bool {
+	seen := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		if !account.Provider(value).IsValid() {
+			return false
+		}
+		if _, exists := seen[value]; exists {
+			return false
+		}
+		seen[value] = struct{}{}
+	}
+	return true
+}
+
+func validTierFilters(values []string) bool {
+	seen := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		if value != "free" && value != "super" {
+			return false
+		}
+		if _, exists := seen[value]; exists {
+			return false
+		}
+		seen[value] = struct{}{}
+	}
+	return true
 }
 
 func validModelFilter(value string, allowed ...string) bool {
@@ -108,6 +208,25 @@ func validModelFilter(value string, allowed ...string) bool {
 
 func (s *Service) ListEnabled(ctx context.Context) ([]modeldomain.Route, error) {
 	return s.models.ListEnabled(ctx)
+}
+
+func (s *Service) ListEnabledForClientKey(ctx context.Context, key clientkeydomain.Key) ([]modeldomain.Route, error) {
+	scope, valid := clientkeydomain.NormalizeAccountScope(clientkeydomain.AccountScope{Providers: key.ProviderScope, Tiers: key.TierScope})
+	if !valid {
+		return nil, ErrInvalidFilter
+	}
+	if !scope.IsRestricted() {
+		return s.models.ListEnabled(ctx)
+	}
+	providers := scope.Providers.Values()
+	if len(providers) == 1 && providers[0] == "all" {
+		providers = nil
+	}
+	tiers := scope.Tiers.Values()
+	if len(tiers) == 1 && tiers[0] == "all" {
+		tiers = nil
+	}
+	return s.models.ListEnabledForScope(ctx, repository.ModelListFilter{Providers: providers, Tiers: tiers})
 }
 
 func (s *Service) Get(ctx context.Context, id uint64) (modeldomain.Route, error) {
@@ -190,7 +309,7 @@ func (s *Service) Delete(ctx context.Context, id uint64) error {
 }
 
 func (s *Service) BatchDelete(ctx context.Context, ids []uint64) (int64, error) {
-	values, err := normalizeBatchIDs(ids)
+	values, err := normalizeModelRouteBatchIDs(ids)
 	if err != nil {
 		return 0, err
 	}
@@ -269,7 +388,7 @@ func (s *Service) validateBoundAccounts(ctx context.Context, providerValue accou
 
 // BatchSetEnabled 批量更新模型路由启停状态。
 func (s *Service) BatchSetEnabled(ctx context.Context, ids []uint64, enabled bool) (int64, error) {
-	values, err := normalizeBatchIDs(ids)
+	values, err := normalizeModelRouteBatchIDs(ids)
 	if err != nil {
 		return 0, err
 	}
@@ -320,7 +439,7 @@ func (s *Service) syncAllAccounts(ctx context.Context) (int, error) {
 		return s.syncAccountCapabilities(workCtx, value, adapter)
 	})
 	pool := s.bulkPool.Snapshot()
-	s.logger.Info("model_bulk_sync_completed", "total", summary.Total, "submitted", summary.Submitted, "succeeded", summary.Succeeded, "failed", summary.Failed, "panicked", summary.Panicked, "duration_ms", summary.Duration.Milliseconds(), "canceled", summary.Canceled, "pool_limit", pool.Limit, "pool_active", pool.Active, "pool_peak", pool.Peak, "error", runErr)
+	s.logger.Info("model_bulk_sync_completed", "total", summary.Total, "submitted", summary.Submitted, "succeeded", summary.Succeeded, "failed", summary.Failed, "panicked", summary.Panicked, "duration_ms", summary.Duration.Milliseconds(), "canceled", summary.Canceled, "pool_limit", pool.Limit, "pool_active", pool.Active, "pool_queued", pool.Queued, "pool_peak", pool.Peak, "error", runErr)
 	if runErr != nil {
 		return 0, runErr
 	}
@@ -434,6 +553,18 @@ func (s *Service) syncAccountCapabilities(ctx context.Context, value account.Cre
 		return nil, err
 	}
 	models := normalizeDiscoveredModels(values)
+	if normalizer, ok := adapter.(provider.AccountModelCapabilityNormalizer); ok {
+		var billing *account.Billing
+		snapshot, billingErr := s.accounts.GetBilling(ctx, credential.ID)
+		if billingErr == nil {
+			billing = &snapshot
+		} else if !errors.Is(billingErr, repository.ErrNotFound) {
+			// Billing 不存在按 Unknown 处理；其他仓储错误保留失败语义。
+			s.markCapabilitySyncFailed(credential.ID, attemptedAt, billingErr)
+			return nil, billingErr
+		}
+		models = normalizeDiscoveredModels(normalizer.NormalizeAccountModelCapabilities(models, billing, credential))
+	}
 	if err := s.models.ReplaceAccountCapabilities(ctx, credential.ID, models, attemptedAt); err != nil {
 		s.markCapabilitySyncFailed(credential.ID, attemptedAt, err)
 		return nil, err
@@ -466,24 +597,23 @@ func (s *Service) markCapabilitySyncFailed(accountID uint64, attemptedAt time.Ti
 }
 
 func normalizePage(page, pageSize int) (int, int) {
-	if page < 1 {
-		page = 1
-	}
-	if pageSize < 1 {
-		pageSize = 20
-	}
-	if pageSize > 100 {
-		pageSize = 100
-	}
-	return page, pageSize
+	return repository.NormalizePage(page, pageSize, repository.DefaultPageSize)
 }
 
 func normalizeBatchIDs(ids []uint64) ([]uint64, error) {
+	return normalizeIDs(ids, repository.MaxPageSize, "模型")
+}
+
+func normalizeModelRouteBatchIDs(ids []uint64) ([]uint64, error) {
+	return normalizeIDs(ids, maxModelBatchSize, "模型能力路由")
+}
+
+func normalizeIDs(ids []uint64, limit int, label string) ([]uint64, error) {
 	if len(ids) == 0 {
 		return nil, invalidInput("至少选择一个模型")
 	}
-	if len(ids) > 500 {
-		return nil, invalidInput("单次最多处理 500 个模型")
+	if len(ids) > limit {
+		return nil, invalidInput(fmt.Sprintf("单次最多处理 %d 条%s", limit, label))
 	}
 	seen := make(map[uint64]struct{}, len(ids))
 	result := make([]uint64, 0, len(ids))

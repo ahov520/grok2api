@@ -2,11 +2,13 @@ package app
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
 
 	accountapp "github.com/chenyme/grok2api/backend/internal/application/account"
+	auditapp "github.com/chenyme/grok2api/backend/internal/application/audit"
 	accountdomain "github.com/chenyme/grok2api/backend/internal/domain/account"
 	"github.com/chenyme/grok2api/backend/internal/infra/provider"
 	"github.com/chenyme/grok2api/backend/internal/repository"
@@ -14,14 +16,16 @@ import (
 )
 
 const (
-	startupRecoveryBudget    = 20 * time.Second
-	startupCriticalWindow    = 2 * time.Minute
-	startupCriticalLimit     = 100
-	statsigWarmupInterval    = 15 * time.Minute
-	webQuotaStaleAfter       = 30 * time.Minute
-	webQuotaCatchupEvery     = 30 * time.Minute
-	modelCatalogStaleAfter   = 24 * time.Hour
-	modelCatalogCatchupEvery = 6 * time.Hour
+	startupRecoveryBudget      = 20 * time.Second
+	startupCriticalWindow      = 2 * time.Minute
+	startupCriticalLimit       = 100
+	statsigWarmupInterval      = 15 * time.Minute
+	webQuotaStaleAfter         = 30 * time.Minute
+	webQuotaCatchupEvery       = 30 * time.Minute
+	consoleUsageMigrationEvery = 24 * time.Hour
+	consoleUsageMigrationRetry = 5 * time.Minute
+	modelCatalogStaleAfter     = 24 * time.Hour
+	modelCatalogCatchupEvery   = 6 * time.Hour
 )
 
 type startupReport struct {
@@ -116,20 +120,23 @@ func readinessSnapshot(
 	models repository.ModelRepository,
 	accounts repository.AccountRepository,
 	providers *provider.Registry,
+	ledger *auditapp.Service,
 ) httpserver.ReadinessSnapshot {
 	phase, updatedAt, report, statsig := state.snapshot()
 	snapshot := httpserver.ReadinessSnapshot{
 		Ready: false, State: phase, UpdatedAt: updatedAt, Startup: newReadinessStartupReport(report),
 		Components: map[string]httpserver.ReadinessComponent{
-			"runtime_store": {State: "unknown"},
-			"grok_build":    {State: "unknown"},
-			"grok_web":      {State: "unknown"},
-			"statsig":       statsig,
+			"runtime_store":  {State: "unknown"},
+			"billing_ledger": {State: "unknown"},
+			"grok_build":     {State: "unknown"},
+			"grok_web":       {State: "unknown"},
+			"statsig":        statsig,
 		},
 	}
 	if phase != "running" {
 		return snapshot
 	}
+	ledgerDegraded := false
 	healthCtx, cancel := context.WithTimeout(ctx, time.Second)
 	err := runtimeHealth(healthCtx)
 	cancel()
@@ -139,6 +146,20 @@ func readinessSnapshot(
 		return snapshot
 	}
 	snapshot.Components["runtime_store"] = httpserver.ReadinessComponent{State: "ready"}
+	if ledger != nil {
+		ledgerState := ledger.LedgerSnapshot()
+		if ledgerState.Ready {
+			snapshot.Components["billing_ledger"] = httpserver.ReadinessComponent{State: "ready"}
+		} else {
+			detail := fmt.Sprintf("审计账本不可用；连续失败 %d 次，丢失 %d 条，队列 %d/%d", ledgerState.ConsecutiveFailures, ledgerState.Dropped, ledgerState.QueueDepth, ledgerState.QueueCapacity)
+			snapshot.Components["billing_ledger"] = httpserver.ReadinessComponent{State: "degraded", Detail: detail}
+			if ledgerState.Irrecoverable || ledgerState.Mode == auditapp.LedgerModeEnforce {
+				snapshot.State = "not_ready"
+				return snapshot
+			}
+			ledgerDegraded = true
+		}
+	}
 
 	routes, err := models.ListConfiguredEnabled(ctx)
 	if err != nil {
@@ -162,13 +183,23 @@ func readinessSnapshot(
 		if usable[route.Provider] || route.SupportedAccounts == 0 {
 			continue
 		}
-		candidates, listErr := accounts.ListRoutingCandidates(ctx, route.Provider, route.UpstreamModel, providers.QuotaMode(route.Provider, route.UpstreamModel))
+		candidates, listErr := accounts.ListRoutingCandidates(ctx, route.Provider, route.ID, route.UpstreamModel, providers.QuotaMode(route.Provider, route.UpstreamModel))
 		if listErr != nil {
 			providerErrors[route.Provider] = true
 			continue
 		}
 		for _, candidate := range candidates {
-			if startupCandidateUsable(candidate, now, providers) {
+			if !startupCandidateUsable(candidate, now, providers) {
+				continue
+			}
+			material, materialErr := accounts.GetCredentialMaterial(ctx, candidate.Credential.ID, candidate.Credential.Provider)
+			if materialErr != nil {
+				if !errors.Is(materialErr, repository.ErrNotFound) {
+					providerErrors[route.Provider] = true
+				}
+				continue
+			}
+			if material.EncryptedAccessToken != "" {
 				usable[route.Provider] = true
 				break
 			}
@@ -211,7 +242,7 @@ func readinessSnapshot(
 		return snapshot
 	}
 	snapshot.Ready = true
-	if unavailableProviders > 0 {
+	if unavailableProviders > 0 || ledgerDegraded {
 		snapshot.State = "degraded"
 	} else {
 		snapshot.State = "ready"
@@ -244,7 +275,7 @@ func newReadinessStartupReport(report startupReport) *httpserver.ReadinessStartu
 
 func startupCandidateUsable(candidate accountdomain.RoutingCandidate, now time.Time, providers *provider.Registry) bool {
 	credential := candidate.Credential
-	if credential.EncryptedAccessToken == "" || credential.AuthStatus != accountdomain.AuthStatusActive {
+	if credential.AuthType == "" || credential.AuthStatus != accountdomain.AuthStatusActive {
 		return false
 	}
 	refreshable := credential.AuthType == accountdomain.AuthTypeOAuth
@@ -352,7 +383,7 @@ func (a *Application) queueDueWebQuotaRefresh(ctx context.Context) {
 		return
 	}
 	for _, window := range windows {
-		a.accounts.QueueWebQuotaRefresh(window.AccountID, window.Mode)
+		a.accounts.QueueQuotaRefresh(window.AccountID, window.Mode)
 	}
 	a.startup.updateReport(func(report *startupReport) { report.DueWebQuotasQueued = len(windows) })
 	if len(windows) > 0 {
@@ -384,6 +415,30 @@ func (a *Application) runWebQuotaCatchup(ctx context.Context) {
 			a.logger.Warn("web_quota_stale_catchup_failed", "error", err)
 		}
 		resetTimer(timer, webQuotaCatchupEvery)
+	}
+}
+
+func (a *Application) runConsoleUsageMigration(ctx context.Context) {
+	timer := time.NewTimer(5 * time.Second)
+	defer timer.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-timer.C:
+		}
+		succeeded, failed, err := a.accounts.SyncIncompleteConsoleQuotas(ctx)
+		nextRun := consoleUsageMigrationEvery
+		if err != nil && ctx.Err() == nil {
+			a.logger.Warn("console_usage_migration_failed", "succeeded", succeeded, "failed", failed, "error", err)
+			nextRun = consoleUsageMigrationRetry
+		} else if failed > 0 {
+			a.logger.Warn("console_usage_migration_incomplete", "succeeded", succeeded, "failed", failed)
+			nextRun = consoleUsageMigrationRetry
+		} else if succeeded > 0 {
+			a.logger.Info("console_usage_migration_completed", "succeeded", succeeded, "failed", failed)
+		}
+		resetTimer(timer, nextRun)
 	}
 }
 

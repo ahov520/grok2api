@@ -10,7 +10,7 @@ import { formatDateTime, formatNumber } from "@/shared/lib/format";
 export function AccountQuota({ quota, billing, locale }: { quota: QuotaDTO; billing?: BillingDTO; locale: string }) {
   const { t } = useTranslation();
   if (quota.type === "unknown") {
-    return <span className="text-xs text-muted-foreground">{t("accounts.quotaUnknown")}</span>;
+    return <span className="text-xs text-muted-foreground">{t("accountType.pending")}</span>;
   }
   if (quota.type !== "free") {
     return <BuildQuota quota={quota} billing={billing} locale={locale} />;
@@ -20,13 +20,11 @@ export function AccountQuota({ quota, billing, locale }: { quota: QuotaDTO; bill
   const used = formatNumber(quota.used, locale, 0);
   const limit = formatNumber(quota.limit, locale, 0);
   const isEstimated = !quota.limitKnown;
-  const statusDescription = quota.status === "waitingReset" && quota.nextProbeAt
+  const recoveryDescription = quota.nextProbeAt
     ? t("accounts.waitingResetUntil", { time: formatDateTime(quota.nextProbeAt, locale) })
     : quota.status === "probing"
       ? t("accounts.probingQuota")
-      : quota.confirmed
-        ? t("accounts.upstreamConfirmed")
-        : null;
+      : t("accounts.quotaResetUnknown");
   const usage = quota.limit > 0
     ? isEstimated ? t("accounts.freeEstimatedUsage", { used, limit }) : `${used} / ${limit} tokens`
     : t("accounts.freeObservedUsage", { used });
@@ -43,30 +41,30 @@ export function AccountQuota({ quota, billing, locale }: { quota: QuotaDTO; bill
                   <Info className="size-3.5" />
                 </button>
               </TooltipTrigger>
-              <TooltipContent>{t("accounts.freeEstimatedDescription")}</TooltipContent>
+              <TooltipContent className="max-w-80 space-y-1">
+                <div>{t("accounts.freeEstimatedDescription")}</div>
+                <div className="text-muted-foreground">{recoveryDescription}</div>
+              </TooltipContent>
             </Tooltip>
           ) : null}
         </div>
         <span className="shrink-0 text-muted-foreground">{isEstimated ? "≈" : ""}{formatNumber(quota.usagePercent, locale, 1)}%</span>
       </div>
       <div className="h-1.5 overflow-hidden rounded-full bg-muted"><div className="h-full bg-primary" style={{ width: `${percent}%` }} /></div>
-      {statusDescription ? <div className="text-[11px] text-muted-foreground">{statusDescription}</div> : null}
     </div>
   );
 }
 
 function BuildQuota({ quota, billing, locale }: { quota: QuotaDTO; billing?: BillingDTO; locale: string }) {
   const { t } = useTranslation();
-  const hasWeekly = billing?.usagePeriodType === "USAGE_PERIOD_TYPE_WEEKLY";
-  const hasMonthly = quota.limit > 0;
+  const percentageQuota = quota.unit === "percent";
+  const hasWeekly = percentageQuota || billing?.usagePeriodType === "USAGE_PERIOD_TYPE_WEEKLY";
+  const hasMonthly = !percentageQuota && quota.limit > 0;
   if (!hasWeekly && !hasMonthly) return <span className="text-xs text-muted-foreground">{t("accounts.paidQuotaUsage")}</span>;
 
-  const weeklyPercent = Math.max(0, Math.min(100, billing?.creditUsagePercent ?? 0));
+  const weeklyPercent = Math.max(0, Math.min(100, percentageQuota ? quota.usagePercent : (billing?.creditUsagePercent ?? 0)));
   const monthlyPercent = Math.max(0, Math.min(100, quota.usagePercent));
-  const statusDescription = quota.status === "waitingReset" && quota.nextProbeAt
-    ? t("accounts.paidWaitingResetUntil", { time: formatDateTime(quota.nextProbeAt, locale) })
-    : quota.status === "probing" ? t("accounts.paidProbingQuota") : null;
-
+  const weeklyPeriodEnd = quota.periodEnd ?? billing?.usagePeriodEnd;
   return (
     <div className="w-full min-w-0 space-y-1.5">
       <div className={cn("grid w-full min-w-0 divide-x divide-border/70", hasWeekly && hasMonthly ? "grid-cols-2" : "grid-cols-1")}>
@@ -80,7 +78,7 @@ function BuildQuota({ quota, billing, locale }: { quota: QuotaDTO; billing?: Bil
             </TooltipTrigger>
             <TooltipContent>
               <div>{t("accounts.weeklyLimit", { percent: formatNumber(100 - weeklyPercent, locale, 1) })}</div>
-              <div className="text-muted-foreground">{billing?.usagePeriodEnd ? t("accounts.quotaResetAt", { time: formatDateTime(billing.usagePeriodEnd, locale) }) : t("accounts.quotaResetUnknown")}</div>
+              <div className="text-muted-foreground">{weeklyPeriodEnd ? t("accounts.quotaResetAt", { time: formatDateTime(weeklyPeriodEnd, locale) }) : t("accounts.quotaResetUnknown")}</div>
             </TooltipContent>
           </Tooltip>
         ) : null}
@@ -99,7 +97,6 @@ function BuildQuota({ quota, billing, locale }: { quota: QuotaDTO; billing?: Bil
           </Tooltip>
         ) : null}
       </div>
-      {statusDescription ? <div className="text-[11px] text-muted-foreground">{statusDescription}</div> : null}
     </div>
   );
 }
@@ -108,9 +105,24 @@ const visibleWebQuotaModes = ["auto", "fast", "expert", "heavy"] as const;
 
 export function ConsoleQuota({ windows, locale }: { windows: NonNullable<AccountDTO["quotaWindows"]>; locale: string }) {
   const { t } = useTranslation();
-  const window = windows.find((value) => value.mode === "console") ?? windows[0];
-  if (!window) return <span className="text-xs text-muted-foreground">{t("accounts.quotaNotSynced")}</span>;
-  return <WebQuotaMode mode="Console" window={window} locale={locale} />;
+  if (windows.length === 0) return <span className="text-xs text-muted-foreground">{t("accounts.quotaNotSynced")}</span>;
+  const windowsByMode = new Map(windows.map((window) => [window.mode, window]));
+  const modes = [
+    { mode: "console", label: t("creativeConsole.modes.chat") },
+    { mode: "console_image", label: t("creativeConsole.modes.image") },
+    { mode: "console_video", label: t("creativeConsole.modes.video") },
+  ] as const;
+  return (
+    <div className="grid w-full min-w-0 grid-cols-3 divide-x divide-border/70">
+      {modes.map(({ mode, label }) => {
+        const window = windowsByMode.get(mode);
+        if (!window) {
+          return <div key={mode} className="min-w-0 px-2 first:pl-0 last:pr-0"><div className="flex items-center justify-between gap-1 text-[11px]"><span className="truncate text-muted-foreground">{label}</span><span className="text-muted-foreground">-</span></div><div className="mt-1.5 h-1.5 rounded-full bg-muted" /></div>;
+        }
+        return <WebQuotaMode key={mode} mode={label} window={window} locale={locale} compact recoveryProbe={mode === "console" && window.remaining === 0} />;
+      })}
+    </div>
+  );
 }
 
 export function WebQuota({ windows, locale, tier }: { windows: NonNullable<AccountDTO["quotaWindows"]>; locale: string; tier?: AccountDTO["webTier"] }) {
@@ -160,7 +172,7 @@ function WeeklyWebQuota({ window, locale, t }: { window: WebQuotaWindow; locale:
   );
 }
 
-function WebQuotaMode({ mode, window, locale, compact = false }: { mode: string; window: WebQuotaWindow; locale: string; compact?: boolean }) {
+function WebQuotaMode({ mode, window, locale, compact = false, recoveryProbe = false }: { mode: string; window: WebQuotaWindow; locale: string; compact?: boolean; recoveryProbe?: boolean }) {
   const { t } = useTranslation();
   const used = Math.max(0, window.total - window.remaining);
   const percent = window.total > 0 ? Math.max(0, Math.min(100, used / window.total * 100)) : 0;
@@ -172,7 +184,7 @@ function WebQuotaMode({ mode, window, locale, compact = false }: { mode: string;
           <div className="mt-1.5 h-1.5 overflow-hidden rounded-full bg-muted"><div className="h-full bg-primary" style={{ width: `${percent}%` }} /></div>
         </button>
       </TooltipTrigger>
-      <TooltipContent><div>{t("accounts.webModeQuotaRemaining", { mode, remaining: formatNumber(window.remaining, locale, 0) })}</div><div className="text-muted-foreground">{window.resetAt ? t("accounts.quotaResetAt", { time: formatDateTime(window.resetAt, locale) }) : t("accounts.quotaResetUnknown")}</div></TooltipContent>
+      <TooltipContent><div>{t("accounts.webModeQuotaRemaining", { mode, remaining: formatNumber(window.remaining, locale, 0) })}</div><div className="text-muted-foreground">{window.resetAt ? recoveryProbe ? t("console.recoveryProbeAt", { time: formatDateTime(window.resetAt, locale) }) : t("accounts.quotaResetAt", { time: formatDateTime(window.resetAt, locale) }) : t("accounts.quotaResetUnknown")}</div></TooltipContent>
     </Tooltip>
   );
 }

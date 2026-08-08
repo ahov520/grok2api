@@ -130,36 +130,118 @@ func TestNormalizeResponsesRequestLoadsClientToolSearchOutput(t *testing.T) {
 	}
 }
 
-func TestNormalizeResponsesRequestRejectsHostedToolSearch(t *testing.T) {
-	_, _, err := normalizeResponsesRequest([]byte(`{
-		"model":"public","input":"hello",
-		"tools":[{"type":"tool_search"}]
+func TestNormalizeResponsesRequestLoadsServerToolSearchHistory(t *testing.T) {
+	normalized, compatibility, err := normalizeResponsesRequest([]byte(`{
+		"model":"public",
+		"input":[
+			{"type":"tool_search_call","execution":"server","call_id":"search_1","arguments":{"goal":"shipping"}},
+			{"type":"tool_search_output","execution":"server","call_id":"search_1","status":"completed","tools":[
+				{"type":"function","name":"get_eta","defer_loading":true,"parameters":{"type":"object"}}
+			]}
+		]
 	}`), "grok-4.5")
-	requestErr, ok := err.(*responsesRequestError)
-	if !ok || requestErr.Code != "unsupported_parameter" || requestErr.Param != "tools[0].execution" {
-		t.Fatalf("error = %#v", err)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var request map[string]any
+	if err := json.Unmarshal(normalized, &request); err != nil {
+		t.Fatal(err)
+	}
+	tools := request["tools"].([]any)
+	if len(tools) != 1 || tools[0].(map[string]any)["name"] != "get_eta" || tools[0].(map[string]any)["defer_loading"] != nil {
+		t.Fatalf("tools = %#v", tools)
+	}
+	items := request["input"].([]any)
+	if len(items) != 2 || items[0].(map[string]any)["role"] != "developer" || items[1].(map[string]any)["role"] != "developer" {
+		t.Fatalf("history = %#v", items)
+	}
+	if compatibility == nil || !strings.Contains(compatibility.warningHeader(), "server_tool_search_history_approximated") {
+		t.Fatalf("compatibility = %#v", compatibility)
 	}
 }
 
-func TestNormalizeResponsesRequestRejectsParallelClientToolSearch(t *testing.T) {
-	_, _, err := normalizeResponsesRequest([]byte(`{
+func TestNormalizeResponsesRequestEagerLoadsServerToolSearch(t *testing.T) {
+	normalized, compatibility, err := normalizeResponsesRequest([]byte(`{
+		"model":"public","input":"hello",
+		"tools":[
+			{"type":"function","name":"lookup","defer_loading":true,"parameters":{"type":"object"}},
+			{"type":"tool_search"}
+		],
+		"tool_choice":{"type":"tool_search"}
+	}`), "grok-4.5")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(normalized, &payload); err != nil {
+		t.Fatal(err)
+	}
+	tools := payload["tools"].([]any)
+	if len(tools) != 1 || tools[0].(map[string]any)["name"] != "lookup" || tools[0].(map[string]any)["defer_loading"] != nil || payload["tool_choice"] != "auto" {
+		t.Fatalf("payload = %#v", payload)
+	}
+	if compatibility == nil || !strings.Contains(compatibility.warningHeader(), "server_tool_search_eager_loaded") || !strings.Contains(compatibility.warningHeader(), "server_tool_search_choice_downgraded") {
+		t.Fatalf("compatibility = %#v", compatibility)
+	}
+}
+
+func TestNormalizeResponsesRequestDropsEmptyServerToolSearchChoice(t *testing.T) {
+	normalized, _, err := normalizeResponsesRequest([]byte(`{
+		"model":"public","input":"hello",
+		"tools":[{"type":"tool_search"}],
+		"tool_choice":{"type":"tool_search"},
+		"parallel_tool_calls":true
+	}`), "grok-4.5")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(normalized, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := payload["tools"]; exists {
+		t.Fatalf("tools = %#v", payload["tools"])
+	}
+	if _, exists := payload["tool_choice"]; exists {
+		t.Fatalf("tool_choice = %#v", payload["tool_choice"])
+	}
+	if _, exists := payload["parallel_tool_calls"]; exists {
+		t.Fatalf("parallel_tool_calls = %#v", payload["parallel_tool_calls"])
+	}
+}
+
+func TestNormalizeResponsesRequestSerializesParallelClientToolSearch(t *testing.T) {
+	normalized, compatibility, err := normalizeResponsesRequest([]byte(`{
 		"model":"public","input":"hello","parallel_tool_calls":true,
 		"tools":[{"type":"tool_search","execution":"client"}]
 	}`), "grok-4.5")
-	requestErr, ok := err.(*responsesRequestError)
-	if !ok || requestErr.Code != "unsupported_parameter" || requestErr.Param != "parallel_tool_calls" {
-		t.Fatalf("error = %#v", err)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(normalized, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload["parallel_tool_calls"] != false || compatibility == nil || !strings.Contains(compatibility.warningHeader(), "client_tool_search_forced_serial") {
+		t.Fatalf("payload=%#v compatibility=%#v", payload, compatibility)
 	}
 }
 
-func TestNormalizeResponsesRequestRejectsDeferredToolWithoutSearch(t *testing.T) {
-	_, _, err := normalizeResponsesRequest([]byte(`{
+func TestNormalizeResponsesRequestLoadsDeferredToolWithoutSearch(t *testing.T) {
+	normalized, compatibility, err := normalizeResponsesRequest([]byte(`{
 		"model":"public","input":"hello",
 		"tools":[{"type":"function","name":"lookup","defer_loading":true,"parameters":{"type":"object"}}]
 	}`), "grok-4.5")
-	requestErr, ok := err.(*responsesRequestError)
-	if !ok || requestErr.Code != "invalid_parameter" || requestErr.Param != "tools[0].defer_loading" {
-		t.Fatalf("error = %#v", err)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(normalized, &payload); err != nil {
+		t.Fatal(err)
+	}
+	tool := payload["tools"].([]any)[0].(map[string]any)
+	if tool["name"] != "lookup" || tool["defer_loading"] != nil || compatibility == nil || !strings.Contains(compatibility.warningHeader(), "orphan_deferred_tool_loaded") {
+		t.Fatalf("tool=%#v compatibility=%#v", tool, compatibility)
 	}
 }
 
@@ -181,6 +263,161 @@ func TestNormalizeResponsesRequestKeepsOrdinaryFunctionsOnNativePath(t *testing.
 	tool := request["tools"].([]any)[0].(map[string]any)
 	if tool["name"] != "lookup" || tool["description"] != "Lookup" {
 		t.Fatalf("普通函数被意外改写: %#v", tool)
+	}
+}
+
+func TestNormalizeResponsesRequestRemovesNullableFunctionParameterRoot(t *testing.T) {
+	normalized, compatibility, err := normalizeResponsesRequest([]byte(`{
+		"model":"public","input":"hello",
+		"tools":[{"type":"function","name":"automation_update","parameters":{
+			"anyOf":[
+				{"type":"object","properties":{"title":{"type":"string"}},"required":["title"],"additionalProperties":false},
+				{"type":"null"}
+			]
+		}}]
+	}`), "grok-4.5")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if compatibility == nil || !strings.Contains(compatibility.warningHeader(), "function_parameters_nullable_root_normalized") {
+		t.Fatalf("compatibility = %#v", compatibility)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(normalized, &payload); err != nil {
+		t.Fatal(err)
+	}
+	parameters := payload["tools"].([]any)[0].(map[string]any)["parameters"].(map[string]any)
+	if parameters["type"] != "object" || parameters["anyOf"] != nil || parameters["additionalProperties"] != false {
+		t.Fatalf("upstream parameters = %#v", parameters)
+	}
+	properties := parameters["properties"].(map[string]any)
+	if properties["title"].(map[string]any)["type"] != "string" {
+		t.Fatalf("upstream properties = %#v", properties)
+	}
+	visibleParameters := compatibility.visibleTools[0].(map[string]any)["parameters"].(map[string]any)
+	if _, exists := visibleParameters["anyOf"]; !exists || visibleParameters["type"] != nil {
+		t.Fatalf("visible parameters were mutated = %#v", visibleParameters)
+	}
+}
+
+func TestNormalizeResponsesRequestRejectsNullableNonObjectFunctionRoot(t *testing.T) {
+	_, _, err := normalizeResponsesRequest([]byte(`{
+		"model":"public","input":"hello",
+		"tools":[{"type":"function","name":"invalid","parameters":{
+			"anyOf":[{"type":"object"},{"type":"string"},{"type":"null"}]
+		}}]
+	}`), "grok-4.5")
+	requestErr, ok := err.(*responsesRequestError)
+	if !ok || requestErr.Param != "tools[0].parameters" || requestErr.Code != "invalid_parameter" {
+		t.Fatalf("error = %#v", err)
+	}
+}
+
+func TestNormalizeResponsesRequestRemovesNullableLocalRefFunctionRoot(t *testing.T) {
+	normalized, compatibility, err := normalizeResponsesRequest([]byte(`{
+		"model":"public","input":"hello",
+		"tools":[{"type":"function","name":"lookup","parameters":{
+			"$defs":{"Args":{
+				"type":"object",
+				"properties":{"query":{"type":"string"}},
+				"required":["query"]
+			}},
+			"anyOf":[{"$ref":"#/$defs/Args"},{"type":"null"}]
+		}}]
+	}`), "grok-4.5")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if compatibility == nil || !strings.Contains(compatibility.warningHeader(), "function_parameters_nullable_root_normalized") {
+		t.Fatalf("compatibility = %#v", compatibility)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(normalized, &payload); err != nil {
+		t.Fatal(err)
+	}
+	parameters := payload["tools"].([]any)[0].(map[string]any)["parameters"].(map[string]any)
+	if parameters["type"] != "object" {
+		t.Fatalf("upstream parameters = %#v", parameters)
+	}
+	branches := parameters["anyOf"].([]any)
+	if len(branches) != 1 || branches[0].(map[string]any)["$ref"] != "#/$defs/Args" {
+		t.Fatalf("upstream branches = %#v", branches)
+	}
+	visibleParameters := compatibility.visibleTools[0].(map[string]any)["parameters"].(map[string]any)
+	visibleBranches := visibleParameters["anyOf"].([]any)
+	if len(visibleBranches) != 2 || visibleParameters["type"] != nil {
+		t.Fatalf("visible parameters were mutated = %#v", visibleParameters)
+	}
+}
+
+func TestNormalizeResponsesRequestRejectsNullableExternalRefFunctionRoot(t *testing.T) {
+	_, _, err := normalizeResponsesRequest([]byte(`{
+		"model":"public","input":"hello",
+		"tools":[{"type":"function","name":"lookup","parameters":{
+			"anyOf":[
+				{"$ref":"https://example.com/schema.json#/$defs/Args"},
+				{"type":"null"}
+			]
+		}}]
+	}`), "grok-4.5")
+	requestErr, ok := err.(*responsesRequestError)
+	if !ok || requestErr.Param != "tools[0].parameters" || requestErr.Code != "invalid_parameter" {
+		t.Fatalf("error = %#v", err)
+	}
+}
+
+func TestNormalizeBuildFunctionParametersRootVariants(t *testing.T) {
+	tests := []struct {
+		name   string
+		schema map[string]any
+		check  func(*testing.T, map[string]any, bool)
+	}{
+		{
+			name:   "type array",
+			schema: map[string]any{"type": []any{"object", "null"}, "properties": map[string]any{}},
+			check: func(t *testing.T, normalized map[string]any, changed bool) {
+				if !changed || normalized["type"] != "object" {
+					t.Fatalf("normalized=%#v changed=%v", normalized, changed)
+				}
+			},
+		},
+		{
+			name: "oneOf",
+			schema: map[string]any{"oneOf": []any{
+				map[string]any{"type": "object", "additionalProperties": false},
+				map[string]any{"type": "null"},
+			}},
+			check: func(t *testing.T, normalized map[string]any, changed bool) {
+				if !changed || normalized["type"] != "object" || normalized["oneOf"] != nil {
+					t.Fatalf("normalized=%#v changed=%v", normalized, changed)
+				}
+			},
+		},
+		{
+			name: "nested nullable unchanged",
+			schema: map[string]any{
+				"type": "object",
+				"properties": map[string]any{"value": map[string]any{
+					"anyOf": []any{map[string]any{"type": "string"}, map[string]any{"type": "null"}},
+				}},
+			},
+			check: func(t *testing.T, normalized map[string]any, changed bool) {
+				properties := normalized["properties"].(map[string]any)
+				value := properties["value"].(map[string]any)
+				if changed || value["anyOf"] == nil {
+					t.Fatalf("normalized=%#v changed=%v", normalized, changed)
+				}
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			value, changed, err := normalizeBuildFunctionParametersRoot(test.schema, "tools[0].parameters")
+			if err != nil {
+				t.Fatal(err)
+			}
+			test.check(t, value.(map[string]any), changed)
+		})
 	}
 }
 

@@ -3,6 +3,7 @@ package batch
 import (
 	"context"
 	"errors"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -136,6 +137,87 @@ func TestSharedChildPoolBoundsCategoryAcrossProcesses(t *testing.T) {
 	}
 }
 
+func TestChildPoolsBoundConcurrentRequestsByCategoryAndGlobalLimit(t *testing.T) {
+	global := NewPool(3)
+	refresh := NewChildPool(2, global)
+	syncPool := NewChildPool(2, global)
+
+	var globalActive atomic.Int64
+	var globalPeak atomic.Int64
+	var refreshActive atomic.Int64
+	var refreshPeak atomic.Int64
+	var syncActive atomic.Int64
+	var syncPeak atomic.Int64
+	trackPeak := func(active, peak *atomic.Int64) {
+		current := active.Add(1)
+		for {
+			value := peak.Load()
+			if current <= value || peak.CompareAndSwap(value, current) {
+				return
+			}
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	start := make(chan struct{})
+	work := func(active, peak *atomic.Int64) func(context.Context, int) error {
+		return func(workCtx context.Context, _ int) error {
+			trackPeak(&globalActive, &globalPeak)
+			trackPeak(active, peak)
+			defer globalActive.Add(-1)
+			defer active.Add(-1)
+			select {
+			case <-start:
+				return nil
+			case <-workCtx.Done():
+				return workCtx.Err()
+			}
+		}
+	}
+
+	var wait sync.WaitGroup
+	for _, operation := range []struct {
+		pool   *Pool
+		active *atomic.Int64
+		peak   *atomic.Int64
+	}{
+		{pool: refresh, active: &refreshActive, peak: &refreshPeak},
+		{pool: refresh, active: &refreshActive, peak: &refreshPeak},
+		{pool: syncPool, active: &syncActive, peak: &syncPeak},
+		{pool: syncPool, active: &syncActive, peak: &syncPeak},
+	} {
+		operation := operation
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			_, summary, err := Run(ctx, make([]int, 3), Options{Workers: 3, Pool: operation.pool}, work(operation.active, operation.peak))
+			if err != nil || summary.Succeeded != 3 {
+				t.Errorf("summary = %#v, err = %v", summary, err)
+			}
+		}()
+	}
+
+	deadline := time.After(time.Second)
+	for globalPeak.Load() < 3 {
+		select {
+		case <-deadline:
+			t.Fatal("并发任务未填满全局容量")
+		default:
+			runtime.Gosched()
+		}
+	}
+	close(start)
+	wait.Wait()
+
+	if globalPeak.Load() != 3 {
+		t.Fatalf("global peak = %d", globalPeak.Load())
+	}
+	if refreshPeak.Load() > 2 || syncPeak.Load() > 2 {
+		t.Fatalf("refresh peak = %d, sync peak = %d", refreshPeak.Load(), syncPeak.Load())
+	}
+}
+
 func TestMapIsolatesFailureAndPanic(t *testing.T) {
 	results, summary, err := Map(context.Background(), []int{1, 2, 3}, Options{Workers: 3}, func(_ context.Context, value int) (int, error) {
 		switch value {
@@ -178,6 +260,28 @@ func TestMapObservedReleasesPoolBeforeStartingDownstreamWork(t *testing.T) {
 	})
 	if err != nil || downstreamErr != nil || summary.Succeeded != 1 {
 		t.Fatalf("summary = %#v, err = %v, downstream = %v", summary, err, downstreamErr)
+	}
+}
+
+func TestForEachObservedReturnsSummaryWithoutCollectedResults(t *testing.T) {
+	pool := NewPool(2)
+	var observed atomic.Int64
+	summary, err := ForEachObserved(context.Background(), []int{1, 2, 3}, Options{Workers: 2, Pool: pool}, func(_ context.Context, value int) (int, error) {
+		if value == 2 {
+			return value, errors.New("rejected")
+		}
+		return value * 2, nil
+	}, func(_ int, result Result[int]) {
+		if !result.Completed {
+			t.Error("observer received incomplete result")
+		}
+		observed.Add(1)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if observed.Load() != 3 || summary.Completed != 3 || summary.Succeeded != 2 || summary.Failed != 1 {
+		t.Fatalf("observed = %d, summary = %#v", observed.Load(), summary)
 	}
 }
 
@@ -230,6 +334,64 @@ func TestPoolHotResizeAndChildLimit(t *testing.T) {
 	}
 	if child.Snapshot().Limit != 1 || child.Snapshot().Peak != 3 || global.Snapshot().Peak != 3 {
 		t.Fatalf("child = %#v, global = %#v", child.Snapshot(), global.Snapshot())
+	}
+}
+
+func TestChildSnapshotSeparatesQueuedFromActiveWork(t *testing.T) {
+	global := NewPool(1)
+	child := NewChildPool(1, global)
+	blockerStarted := make(chan struct{})
+	releaseBlocker := make(chan struct{})
+	blockerDone := make(chan error, 1)
+	go func() {
+		blockerDone <- global.Do(context.Background(), func(context.Context) error {
+			close(blockerStarted)
+			<-releaseBlocker
+			return nil
+		})
+	}()
+	<-blockerStarted
+
+	childStarted := make(chan struct{})
+	childDone := make(chan error, 1)
+	go func() {
+		childDone <- child.Do(context.Background(), func(context.Context) error {
+			close(childStarted)
+			return nil
+		})
+	}()
+
+	deadline := time.After(time.Second)
+	for {
+		snapshot := child.Snapshot()
+		if snapshot.Queued == 1 {
+			if snapshot.Active != 0 {
+				t.Fatalf("waiting child snapshot = %#v", snapshot)
+			}
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("child task was not reported as queued")
+		default:
+			runtime.Gosched()
+		}
+	}
+
+	close(releaseBlocker)
+	if err := <-blockerDone; err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-childStarted:
+	case <-time.After(time.Second):
+		t.Fatal("queued child task did not start")
+	}
+	if err := <-childDone; err != nil {
+		t.Fatal(err)
+	}
+	if snapshot := child.Snapshot(); snapshot.Active != 0 || snapshot.Queued != 0 || snapshot.Peak != 1 {
+		t.Fatalf("completed child snapshot = %#v", snapshot)
 	}
 }
 
